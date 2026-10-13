@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host",
-    "build": "vite build",
+    "build": "cp app.js public/app.js && cp style.css public/style.css && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
