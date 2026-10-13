@@ -517,7 +517,7 @@ function compressImage(file) {
 // MESSAGE INPUT HANDLERS
 // ============================================
 messageInput.addEventListener('input', () => {
-  sendBtn.disabled = !messageInput.value.trim() && !selectedImageFile;
+  sendBtn.disabled = !messageInput.value.trim() && !selectedMediaFile;
   updateTyping();
 });
 
