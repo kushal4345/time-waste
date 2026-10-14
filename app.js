@@ -425,7 +425,9 @@ async function sendMediaMessage(caption) {
     sendBtn.disabled = true;
   } catch (err) {
     console.error('Upload error:', err);
-    showToast('Failed to upload. Try again.');
+    showToast('Failed to upload. Tap send to try again.');
+    // Re-enable send button so user can retry
+    sendBtn.disabled = false;
   }
 
   uploadProgress.classList.add('hidden');
@@ -716,7 +718,7 @@ let peers = {}; // username -> { pc, audioEl, candidateQueue }
 let localStream = null;
 let isInCall = false;
 let isMicMuted = false;
-let isSpeakerMuted = false;
+let isSpeakerOn = true; // speaker starts ON (unmuted)
 let callStartTime = null;
 let callTimerInterval = null;
 let currentCallParticipants = {};
@@ -774,7 +776,7 @@ function createRemoteAudioElement(username) {
     existing.id = 'remote-audio-' + username;
     existing.autoplay = true;
     existing.playsInline = true;
-    existing.muted = isSpeakerMuted;
+    existing.muted = !isSpeakerOn; // muted only when speaker is OFF
     if (remoteAudiosContainer) {
       remoteAudiosContainer.appendChild(existing);
     } else {
@@ -1126,6 +1128,9 @@ async function joinGroupCall() {
 
   try {
     localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    // Ensure mic track is enabled (not muted) when joining
+    localStream.getAudioTracks().forEach(track => { track.enabled = true; });
+    isMicMuted = false;
     isInCall = true;
 
     startCallTimer();
@@ -1207,6 +1212,11 @@ function leaveGroupCall(updateDb = true) {
   muteBtn.classList.remove('muted');
   muteBtn.querySelector('span').textContent = 'Mute';
 
+  // Reset speaker state to ON
+  isSpeakerOn = true;
+  speakerBtn.classList.remove('muted');
+  speakerBtn.querySelector('span').textContent = 'Speaker';
+
   if (joinCallBannerBtn) {
     joinCallBannerBtn.textContent = 'Join Call';
     joinCallBannerBtn.classList.remove('in-call');
@@ -1265,12 +1275,16 @@ muteBtn.addEventListener('click', () => {
 });
 
 speakerBtn.addEventListener('click', () => {
-  isSpeakerMuted = !isSpeakerMuted;
+  isSpeakerOn = !isSpeakerOn;
+  const shouldMute = !isSpeakerOn;
   if (remoteAudiosContainer) {
-    remoteAudiosContainer.querySelectorAll('audio').forEach(a => a.muted = isSpeakerMuted);
+    remoteAudiosContainer.querySelectorAll('audio').forEach(a => a.muted = shouldMute);
   }
-  speakerBtn.classList.toggle('muted', isSpeakerMuted);
-  speakerBtn.querySelector('span').textContent = isSpeakerMuted ? 'Muted' : 'Speaker';
+  // Also mute any <audio> elements created directly on body
+  document.querySelectorAll('audio[id^="remote-audio-"]').forEach(a => a.muted = shouldMute);
+  speakerBtn.classList.toggle('muted', !isSpeakerOn);
+  speakerBtn.querySelector('span').textContent = isSpeakerOn ? 'Speaker' : 'Spkr Off';
+  showToast(isSpeakerOn ? '🔊 Speaker on' : '🔇 Speaker off');
 });
 
 // ============================================
