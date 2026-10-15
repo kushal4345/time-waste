@@ -345,11 +345,12 @@ function setupPresence() {
 }
 
 // ============================================
-// MESSAGES & 7-DAY AUTO-CLEANUP
+// MESSAGES & 24-HOUR AUTO-CLEANUP
 // ============================================
-const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const AUTO_DELETE_MS = 24 * 60 * 60 * 1000; // 24 hours
 let previousMessageIds = new Set();
 let isInitialLoad = true;
+let allMessages = {}; // Cache of all messages for date separator tracking
 
 // Scroll Monitoring & Floating Scroll Button
 if (messagesContainer) {
@@ -379,50 +380,101 @@ if (scrollBottomBtn) {
   });
 }
 
+function getLocalDeleted() {
+  const localDeletedKey = 'deleted_msgs_' + currentRoom;
+  return new Set(JSON.parse(localStorage.getItem(localDeletedKey) || '[]'));
+}
+
 function listenForMessages() {
   previousMessageIds.clear();
+  allMessages = {};
   isInitialLoad = true;
 
-  db.ref('messages/' + currentRoom).orderByChild('timestamp').on('value', (snap) => {
+  const messagesRef = db.ref('messages/' + currentRoom).orderByChild('timestamp');
+
+  // ── INITIAL LOAD: fetch all messages once, render in bulk ──
+  messagesRef.once('value', (snap) => {
     messagesList.innerHTML = '';
     lastMessageDate = '';
     const messages = snap.val();
     if (!messages) {
       isInitialLoad = false;
+      attachIncrementalListeners();
       return;
     }
 
     const now = Date.now();
-    const cutoffTime = now - SEVEN_DAYS_MS;
-    const localDeletedKey = 'deleted_msgs_' + currentRoom;
-    const localDeleted = new Set(JSON.parse(localStorage.getItem(localDeletedKey) || '[]'));
+    const cutoffTime = now - AUTO_DELETE_MS;
+    const localDeleted = getLocalDeleted();
+
+    // Use DocumentFragment for batch DOM insertion (no reflows until appended)
+    const fragment = document.createDocumentFragment();
 
     const sorted = Object.entries(messages)
       .map(([key, val]) => ({ id: key, ...val }))
       .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
 
-    let hasNewIncomingMessage = false;
-
     sorted.forEach(msg => {
-      // Auto-cleanup: remove messages older than 7 days
+      // Auto-cleanup: remove messages older than 24 hours
       if (msg.timestamp && msg.timestamp < cutoffTime) {
         db.ref('messages/' + currentRoom + '/' + msg.id).remove().catch(() => {});
         return;
       }
-      // Skip locally deleted messages
       if (localDeleted.has(msg.id)) return;
 
-      if (!isInitialLoad && !previousMessageIds.has(msg.id)) {
-        if (msg.sender && msg.sender !== currentUser) {
-          hasNewIncomingMessage = true;
-        }
-      }
       previousMessageIds.add(msg.id);
-
-      renderMessage(msg);
+      allMessages[msg.id] = msg;
+      renderMessageToTarget(msg, fragment);
     });
 
-    if (hasNewIncomingMessage) {
+    // Single DOM append — no flicker!
+    messagesList.appendChild(fragment);
+    scrollToBottom(false);
+    isInitialLoad = false;
+
+    // Now attach incremental listeners for real-time updates
+    attachIncrementalListeners();
+  });
+}
+
+function attachIncrementalListeners() {
+  const messagesRef = db.ref('messages/' + currentRoom);
+
+  // ── NEW MESSAGE: append to bottom ──
+  messagesRef.orderByChild('timestamp').on('child_added', (snap) => {
+    if (isInitialLoad) return; // Skip during initial load
+    const msgId = snap.key;
+    if (previousMessageIds.has(msgId)) return; // Already rendered
+
+    const msgData = { id: msgId, ...snap.val() };
+
+    // Auto-cleanup old messages
+    const now = Date.now();
+    if (msgData.timestamp && msgData.timestamp < now - AUTO_DELETE_MS) {
+      db.ref('messages/' + currentRoom + '/' + msgId).remove().catch(() => {});
+      return;
+    }
+
+    // Skip locally deleted
+    if (getLocalDeleted().has(msgId)) return;
+
+    previousMessageIds.add(msgId);
+    allMessages[msgId] = msgData;
+
+    // Check if we need a date separator before this message
+    const msgDate = formatMessageDate(msgData.timestamp);
+    if (msgDate !== lastMessageDate) {
+      lastMessageDate = msgDate;
+      const sep = document.createElement('div');
+      sep.className = 'date-separator';
+      sep.innerHTML = '<span>' + msgDate + '</span>';
+      messagesList.appendChild(sep);
+    }
+
+    renderMessageToTarget(msgData, messagesList, true);
+
+    // Sound & unread badge for incoming messages
+    if (msgData.sender && msgData.sender !== currentUser) {
       playReceivedSound();
       if (!isNearBottom) {
         unreadCount++;
@@ -431,12 +483,73 @@ function listenForMessages() {
       }
     }
 
-    if (isInitialLoad || isNearBottom) {
+    // Auto-scroll if user is near bottom
+    if (isNearBottom) {
       scrollToBottom(false);
     }
-
-    isInitialLoad = false;
   });
+
+  // ── MESSAGE UPDATED (reactions, edits, deletions) ──
+  messagesRef.on('child_changed', (snap) => {
+    const msgId = snap.key;
+    const msgData = { id: msgId, ...snap.val() };
+    allMessages[msgId] = msgData;
+
+    // If message was "deleted for everyone", update in place
+    const existingEl = document.getElementById('msg-' + msgId);
+    if (!existingEl) return;
+
+    // Re-render just this one message in place
+    const isOwn = msgData.sender === currentUser;
+    const newDiv = document.createElement('div');
+    newDiv.id = 'msg-' + msgData.id;
+    newDiv.className = 'message ' + (isOwn ? 'own' : 'other') + (msgData.deleted ? ' is-deleted' : '');
+    renderMessageContent(newDiv, msgData);
+    attachMessageEventListeners(newDiv, msgData);
+
+    existingEl.replaceWith(newDiv);
+  });
+
+  // ── MESSAGE REMOVED ──
+  messagesRef.on('child_removed', (snap) => {
+    const msgId = snap.key;
+    previousMessageIds.delete(msgId);
+    delete allMessages[msgId];
+    const el = document.getElementById('msg-' + msgId);
+    if (el) el.remove();
+  });
+}
+
+// Render a message into a target (fragment or messagesList)
+// skipDateSep: true if date separator is already handled externally
+function renderMessageToTarget(msg, target, skipDateSep = false) {
+  if (!skipDateSep) {
+    const msgDate = formatMessageDate(msg.timestamp);
+    if (msgDate !== lastMessageDate) {
+      lastMessageDate = msgDate;
+      const sep = document.createElement('div');
+      sep.className = 'date-separator';
+      sep.innerHTML = '<span>' + msgDate + '</span>';
+      target.appendChild(sep);
+    }
+  }
+
+  if (msg.type === 'system') {
+    const div = document.createElement('div');
+    div.className = 'system-message';
+    div.innerHTML = '<span>' + escapeHtml(msg.text) + '</span>';
+    target.appendChild(div);
+    return;
+  }
+
+  const isOwn = msg.sender === currentUser;
+  const div = document.createElement('div');
+  div.id = 'msg-' + msg.id;
+  div.className = 'message ' + (isOwn ? 'own' : 'other') + (msg.deleted ? ' is-deleted' : '');
+
+  renderMessageContent(div, msg);
+  attachMessageEventListeners(div, msg);
+  target.appendChild(div);
 }
 
 // ============================================
@@ -457,29 +570,10 @@ function formatMessageDate(timestamp) {
   }
 }
 
-function renderMessage(msg) {
-  const msgDate = formatMessageDate(msg.timestamp);
-
-  if (msgDate !== lastMessageDate) {
-    lastMessageDate = msgDate;
-    const sep = document.createElement('div');
-    sep.className = 'date-separator';
-    sep.innerHTML = '<span>' + msgDate + '</span>';
-    messagesList.appendChild(sep);
-  }
-
-  if (msg.type === 'system') {
-    const div = document.createElement('div');
-    div.className = 'system-message';
-    div.innerHTML = '<span>' + escapeHtml(msg.text) + '</span>';
-    messagesList.appendChild(div);
-    return;
-  }
-
+// renderMessageContent fills an existing div with message HTML content
+// Used by both renderMessageToTarget (initial/new) and child_changed (in-place update)
+function renderMessageContent(div, msg) {
   const isOwn = msg.sender === currentUser;
-  const div = document.createElement('div');
-  div.id = 'msg-' + msg.id;
-  div.className = 'message ' + (isOwn ? 'own' : 'other') + (msg.deleted ? ' is-deleted' : '');
 
   const time = new Date(msg.timestamp || Date.now()).toLocaleTimeString('en-US', {
     hour: '2-digit', minute: '2-digit', hour12: true
@@ -604,11 +698,6 @@ function renderMessage(msg) {
   html += '</div>';
 
   div.innerHTML = html;
-
-  // Event Listeners on Message
-  attachMessageEventListeners(div, msg);
-
-  messagesList.appendChild(div);
 }
 
 function formatDuration(sec) {
@@ -1645,6 +1734,7 @@ lightbox.querySelector('.modal-backdrop').addEventListener('click', () => lightb
 let peers = {}; // username -> { pc, audioEl, candidateQueue }
 let localStream = null;
 let isInCall = false;
+let isJoiningCall = false; // guard against ringtone race during async join
 let isMicMuted = false;
 let isSpeakerOn = true; // speaker starts ON (unmuted)
 let callStartTime = null;
@@ -1704,7 +1794,8 @@ function createRemoteAudioElement(username) {
     existing.id = 'remote-audio-' + username;
     existing.autoplay = true;
     existing.playsInline = true;
-    existing.muted = !isSpeakerOn; // muted only when speaker is OFF
+    // Use volume instead of muted for speaker control (more reliable across browsers)
+    existing.volume = isSpeakerOn ? 1.0 : 0.0;
     if (remoteAudiosContainer) {
       remoteAudiosContainer.appendChild(existing);
     } else {
@@ -1812,7 +1903,9 @@ async function initiatePeerConnection(remoteUser) {
 
   pc.ontrack = (event) => {
     console.log('Got remote track from', remoteUser);
+    stopRingtoneSound(); // Stop ringtone as soon as we get remote audio
     audioEl.srcObject = event.streams[0];
+    audioEl.volume = isSpeakerOn ? 1.0 : 0.0;
     audioEl.play().catch(e => console.warn('Audio play error:', e));
   };
 
@@ -1826,6 +1919,9 @@ async function initiatePeerConnection(remoteUser) {
 
   pc.onconnectionstatechange = () => {
     console.log('Connection state with', remoteUser, ':', pc.connectionState);
+    if (pc.connectionState === 'connected') {
+      stopRingtoneSound(); // Ensure ringtone stops when connection is established
+    }
     if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
       closePeerConnection(remoteUser);
     }
@@ -1909,7 +2005,9 @@ function listenForIncomingOffers() {
 
         pc.ontrack = (event) => {
           console.log('Got remote track from', remoteUser);
+          stopRingtoneSound(); // Stop ringtone as soon as we get remote audio
           audioEl.srcObject = event.streams[0];
+          audioEl.volume = isSpeakerOn ? 1.0 : 0.0;
           audioEl.play().catch(e => console.warn('Audio play error:', e));
         };
 
@@ -1921,6 +2019,9 @@ function listenForIncomingOffers() {
 
         pc.onconnectionstatechange = () => {
           console.log('Connection state with', remoteUser, ':', pc.connectionState);
+          if (pc.connectionState === 'connected') {
+            stopRingtoneSound(); // Ensure ringtone stops when connection is established
+          }
           if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
             closePeerConnection(remoteUser);
           }
@@ -1987,12 +2088,17 @@ function listenForCalls() {
     if (count > 0) {
       voiceCallBtn.classList.add('active');
 
-      if (!isInCall && !hasDismissedCallModal) {
+      // Only show incoming call + ringtone if NOT in call, NOT joining, and NOT dismissed
+      if (!isInCall && !isJoiningCall && !hasDismissedCallModal) {
         const callerName = Object.keys(participants)[0];
         incomingCallerName.textContent = callerName;
         incomingCallDesc.textContent = `started a voice call (${count} in call)`;
         incomingCallModal.classList.remove('hidden');
         playRingtoneSound();
+      } else if (isInCall || isJoiningCall) {
+        // If we're in the call or joining, ensure ringtone is stopped
+        stopRingtoneSound();
+        incomingCallModal.classList.add('hidden');
       }
     } else {
       voiceCallBtn.classList.remove('active');
@@ -2046,6 +2152,8 @@ async function joinGroupCall() {
     return;
   }
 
+  // Set joining flag BEFORE async work to prevent ringtone race condition
+  isJoiningCall = true;
   stopRingtoneSound();
   hasDismissedCallModal = true;
   incomingCallModal.classList.add('hidden');
@@ -2055,15 +2163,41 @@ async function joinGroupCall() {
   callTimerEl.textContent = '00:00';
 
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      },
+      video: false
+    });
+
+    // Verify we actually got an audio track
+    const audioTracks = localStream.getAudioTracks();
+    console.log('Got audio tracks:', audioTracks.length, audioTracks.map(t => t.label));
+    if (audioTracks.length === 0) {
+      throw new Error('No audio tracks received from getUserMedia');
+    }
+
     // Ensure mic track is enabled (not muted) when joining
-    localStream.getAudioTracks().forEach(track => { track.enabled = true; });
+    audioTracks.forEach(track => {
+      track.enabled = true;
+      console.log('Audio track enabled:', track.label, 'readyState:', track.readyState);
+    });
     isMicMuted = false;
     isInCall = true;
+    isJoiningCall = false; // Clear joining flag now that we're in call
+
+    // Force stop ringtone again just in case
+    stopRingtoneSound();
 
     startCallTimer();
     callStatusText.textContent = 'Live Voice Call';
     voiceCallBtn.classList.add('active');
+
+    // Reset mute button UI
+    muteBtn.classList.remove('muted');
+    muteBtn.querySelector('span').textContent = 'Mute';
 
     // Register self as participant — onDisconnect auto-removes
     const myRef = db.ref(`calls/${currentRoom}/participants/${currentUser}`);
@@ -2093,6 +2227,7 @@ async function joinGroupCall() {
 
   } catch (err) {
     console.error('Join call error:', err);
+    isJoiningCall = false; // Clear joining flag on error
     if (err.name === 'NotAllowedError') {
       showToast('Microphone permission denied. Please allow mic access and try again.');
     } else {
@@ -2105,6 +2240,7 @@ async function joinGroupCall() {
 function leaveGroupCall(updateDb = true) {
   stopRingtoneSound();
   isInCall = false;
+  isJoiningCall = false;
   isListeningForOffers = false;
 
   if (updateDb && currentRoom && currentUser) {
@@ -2120,11 +2256,23 @@ function leaveGroupCall(updateDb = true) {
     });
   }
 
-  Object.keys(peers).forEach(user => closePeerConnection(user));
+  // Turn off all Firebase signal listeners for our peers before closing connections
+  Object.keys(peers).forEach(user => {
+    const pairKey = getPairKey(currentUser, user);
+    try {
+      db.ref(`calls/${currentRoom}/signals/${pairKey}/ice_${user}`).off();
+      db.ref(`calls/${currentRoom}/signals/${pairKey}/answer`).off();
+      db.ref(`calls/${currentRoom}/signals/${pairKey}/offer`).off();
+    } catch (e) {}
+    closePeerConnection(user);
+  });
   peers = {};
 
   if (localStream) {
-    localStream.getTracks().forEach(t => t.stop());
+    localStream.getTracks().forEach(t => {
+      t.enabled = false;
+      t.stop();
+    });
     localStream = null;
   }
 
@@ -2204,15 +2352,23 @@ muteBtn.addEventListener('click', () => {
 
 speakerBtn.addEventListener('click', () => {
   isSpeakerOn = !isSpeakerOn;
-  const shouldMute = !isSpeakerOn;
+  const newVolume = isSpeakerOn ? 1.0 : 0.0;
+
+  // Only change volume on REMOTE audio elements — never touch local mic stream
   if (remoteAudiosContainer) {
-    remoteAudiosContainer.querySelectorAll('audio').forEach(a => a.muted = shouldMute);
+    remoteAudiosContainer.querySelectorAll('audio').forEach(a => {
+      a.volume = newVolume;
+    });
   }
-  // Also mute any <audio> elements created directly on body
-  document.querySelectorAll('audio[id^="remote-audio-"]').forEach(a => a.muted = shouldMute);
+  // Also update any <audio> elements created directly on body
+  document.querySelectorAll('audio[id^="remote-audio-"]').forEach(a => {
+    a.volume = newVolume;
+  });
+
   speakerBtn.classList.toggle('muted', !isSpeakerOn);
   speakerBtn.querySelector('span').textContent = isSpeakerOn ? 'Speaker' : 'Spkr Off';
   showToast(isSpeakerOn ? '🔊 Speaker on' : '🔇 Speaker off');
+  console.log('Speaker toggled:', isSpeakerOn ? 'ON' : 'OFF', '- local mic unaffected');
 });
 
 // ============================================
