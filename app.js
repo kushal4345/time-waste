@@ -56,9 +56,20 @@ const EMOJIS = [
 let currentUser = '';
 let currentRoom = '';
 let selectedMediaFile = null;
+let isSendingMedia = false;
 let isEmojiPickerOpen = false;
 let typingTimeout = null;
 let lastMessageDate = '';
+let currentReply = null;
+let isNearBottom = true;
+let unreadCount = 0;
+let soundsEnabled = localStorage.getItem('chat_sounds') !== 'false';
+let mediaRecorder = null;
+let recordedAudioChunks = [];
+let recordingTimerInterval = null;
+let recordingStartTime = 0;
+let activeAudio = null;
+let onlineUsersCount = 0;
 
 const ICE_SERVERS = {
   iceServers: [
@@ -85,16 +96,35 @@ const messagesList = $('messages-list');
 const messagesContainer = $('messages-container');
 const messageInput = $('message-input');
 const sendBtn = $('send-btn');
+const voiceRecordBtn = $('voice-record-btn');
+const voiceRecordBar = $('voice-record-bar');
+const voiceRecordTimer = $('voice-record-timer');
+const cancelVoiceRecordBtn = $('cancel-voice-record');
+const sendVoiceRecordBtn = $('send-voice-record');
+const mainInputRow = $('main-input-row');
 const emojiBtn = $('emoji-btn');
 const emojiPicker = $('emoji-picker');
 const emojiGrid = $('emoji-grid');
 const imageInput = $('image-input');
+const imageUploadLabel = $('image-upload-label');
 const imagePreview = $('image-preview');
 const previewImg = $('preview-img');
 const previewVideo = $('preview-video');
+const previewFilename = $('preview-filename');
+const previewFilesize = $('preview-filesize');
 const cancelImageBtn = $('cancel-image');
 const uploadProgress = $('upload-progress');
 const uploadBar = $('upload-bar');
+const uploadStatusText = $('upload-status-text');
+const scrollBottomBtn = $('scroll-bottom-btn');
+const unreadBadge = $('unread-badge');
+const replyBar = $('reply-bar');
+const replySender = $('reply-sender');
+const replyText = $('reply-text');
+const cancelReplyBtn = $('cancel-reply-btn');
+const soundToggleBtn = $('sound-toggle-btn');
+const soundOnIcon = $('sound-on-icon');
+const soundOffIcon = $('sound-off-icon');
 const voiceCallBtn = $('voice-call-btn');
 const activeCallBar = $('active-call-bar');
 const callBarTitle = $('call-bar-title');
@@ -118,6 +148,11 @@ const lightbox = $('lightbox');
 const lightboxImg = $('lightbox-img');
 const lightboxClose = $('lightbox-close');
 const lightboxDownload = $('lightbox-download');
+const lightboxDelete = $('lightbox-delete');
+const deleteModal = $('delete-modal');
+const deleteForEveryoneBtn = $('delete-for-everyone-btn');
+const deleteForMeBtn = $('delete-for-me-btn');
+const deleteCancelBtn = $('delete-cancel-btn');
 const typingIndicator = $('typing-indicator');
 const typingUserEl = $('typing-user');
 
@@ -178,6 +213,7 @@ function joinRoom() {
   listenForMessages();
   listenForTyping();
   listenForCalls();
+  updateInputButtonState();
 
   setTimeout(() => messageInput.focus(), 300);
   sendSystemMessage(currentUser + ' joined the room');
@@ -200,6 +236,12 @@ function leaveRoom() {
   db.ref('calls/' + currentRoom).off();
 
   leaveGroupCall(true);
+  cancelReply();
+  cancelMediaPreview();
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    cancelVoiceRecording();
+  }
+
   messagesList.innerHTML = '';
   lastMessageDate = '';
   currentUser = '';
@@ -207,6 +249,78 @@ function leaveRoom() {
 
   chatScreen.classList.remove('active');
   loginScreen.classList.add('active');
+}
+
+// ============================================
+// PRESENCE (Online Users)
+// ============================================
+// ============================================
+// SOUND EFFECTS (Web Audio API Synthesizer)
+// ============================================
+let sfxAudioCtx = null;
+function getSfxAudioContext() {
+  if (!sfxAudioCtx) {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (AudioCtx) sfxAudioCtx = new AudioCtx();
+  }
+  if (sfxAudioCtx && sfxAudioCtx.state === 'suspended') {
+    sfxAudioCtx.resume().catch(() => {});
+  }
+  return sfxAudioCtx;
+}
+
+function playSentSound() {
+  if (!soundsEnabled) return;
+  try {
+    const ctx = getSfxAudioContext();
+    if (!ctx) return;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = 'sine';
+    const t = ctx.currentTime;
+    osc.frequency.setValueAtTime(440, t);
+    osc.frequency.exponentialRampToValueAtTime(760, t + 0.08);
+    gain.gain.setValueAtTime(0.08, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+    osc.start(t);
+    osc.stop(t + 0.12);
+  } catch (_) {}
+}
+
+function playReceivedSound() {
+  if (!soundsEnabled) return;
+  try {
+    const ctx = getSfxAudioContext();
+    if (!ctx) return;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = 'triangle';
+    const t = ctx.currentTime;
+    osc.frequency.setValueAtTime(659, t);
+    osc.frequency.setValueAtTime(880, t + 0.07);
+    gain.gain.setValueAtTime(0.09, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+    osc.start(t);
+    osc.stop(t + 0.22);
+  } catch (_) {}
+}
+
+if (soundToggleBtn) {
+  const updateSoundIcons = () => {
+    soundOnIcon.classList.toggle('hidden', !soundsEnabled);
+    soundOffIcon.classList.toggle('hidden', soundsEnabled);
+  };
+  updateSoundIcons();
+  soundToggleBtn.addEventListener('click', () => {
+    soundsEnabled = !soundsEnabled;
+    localStorage.setItem('chat_sounds', soundsEnabled ? 'true' : 'false');
+    updateSoundIcons();
+    showToast(soundsEnabled ? '🔊 Chat sounds on' : '🔇 Chat sounds muted');
+  });
 }
 
 // ============================================
@@ -224,51 +338,127 @@ function setupPresence() {
   });
 
   db.ref('presence/' + currentRoom).on('value', (snap) => {
-    const users = snap.val();
-    const count = users ? Object.keys(users).length : 0;
-    onlineCount.textContent = count + ' online';
+    const users = snap.val() || {};
+    onlineUsersCount = Object.keys(users).length;
+    onlineCount.textContent = onlineUsersCount + ' online';
   });
 }
 
 // ============================================
-// MESSAGES
-// ============================================
-// ============================================
 // MESSAGES & 7-DAY AUTO-CLEANUP
 // ============================================
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+let previousMessageIds = new Set();
+let isInitialLoad = true;
+
+// Scroll Monitoring & Floating Scroll Button
+if (messagesContainer) {
+  messagesContainer.addEventListener('scroll', () => {
+    const threshold = 140;
+    const distanceToBottom = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight;
+    isNearBottom = distanceToBottom <= threshold;
+
+    if (scrollBottomBtn) {
+      if (isNearBottom) {
+        scrollBottomBtn.classList.add('hidden');
+        unreadCount = 0;
+        unreadBadge.classList.add('hidden');
+      } else {
+        scrollBottomBtn.classList.remove('hidden');
+      }
+    }
+  });
+}
+
+if (scrollBottomBtn) {
+  scrollBottomBtn.addEventListener('click', () => {
+    scrollToBottom(true);
+    unreadCount = 0;
+    unreadBadge.classList.add('hidden');
+    scrollBottomBtn.classList.add('hidden');
+  });
+}
 
 function listenForMessages() {
+  previousMessageIds.clear();
+  isInitialLoad = true;
+
   db.ref('messages/' + currentRoom).orderByChild('timestamp').on('value', (snap) => {
     messagesList.innerHTML = '';
     lastMessageDate = '';
     const messages = snap.val();
-    if (!messages) return;
+    if (!messages) {
+      isInitialLoad = false;
+      return;
+    }
 
     const now = Date.now();
     const cutoffTime = now - SEVEN_DAYS_MS;
+    const localDeletedKey = 'deleted_msgs_' + currentRoom;
+    const localDeleted = new Set(JSON.parse(localStorage.getItem(localDeletedKey) || '[]'));
 
     const sorted = Object.entries(messages)
       .map(([key, val]) => ({ id: key, ...val }))
       .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
 
+    let hasNewIncomingMessage = false;
+
     sorted.forEach(msg => {
-      // Auto-cleanup: remove messages older than 7 days from Firebase so database never fills up
+      // Auto-cleanup: remove messages older than 7 days
       if (msg.timestamp && msg.timestamp < cutoffTime) {
         db.ref('messages/' + currentRoom + '/' + msg.id).remove().catch(() => {});
         return;
       }
+      // Skip locally deleted messages
+      if (localDeleted.has(msg.id)) return;
+
+      if (!isInitialLoad && !previousMessageIds.has(msg.id)) {
+        if (msg.sender && msg.sender !== currentUser) {
+          hasNewIncomingMessage = true;
+        }
+      }
+      previousMessageIds.add(msg.id);
+
       renderMessage(msg);
     });
 
-    scrollToBottom();
+    if (hasNewIncomingMessage) {
+      playReceivedSound();
+      if (!isNearBottom) {
+        unreadCount++;
+        unreadBadge.textContent = unreadCount;
+        unreadBadge.classList.remove('hidden');
+      }
+    }
+
+    if (isInitialLoad || isNearBottom) {
+      scrollToBottom(false);
+    }
+
+    isInitialLoad = false;
   });
 }
 
+// ============================================
+// WHATSAPP MESSAGE FORMATTING & RENDERING
+// ============================================
+function formatMessageDate(timestamp) {
+  const date = new Date(timestamp || Date.now());
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  if (date.toDateString() === today.toDateString()) {
+    return 'Today';
+  } else if (date.toDateString() === yesterday.toDateString()) {
+    return 'Yesterday';
+  } else {
+    return date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+  }
+}
+
 function renderMessage(msg) {
-  const msgDate = new Date(msg.timestamp || Date.now()).toLocaleDateString('en-US', {
-    weekday: 'long', month: 'short', day: 'numeric'
-  });
+  const msgDate = formatMessageDate(msg.timestamp);
 
   if (msgDate !== lastMessageDate) {
     lastMessageDate = msgDate;
@@ -288,17 +478,43 @@ function renderMessage(msg) {
 
   const isOwn = msg.sender === currentUser;
   const div = document.createElement('div');
-  div.className = 'message ' + (isOwn ? 'own' : 'other');
+  div.id = 'msg-' + msg.id;
+  div.className = 'message ' + (isOwn ? 'own' : 'other') + (msg.deleted ? ' is-deleted' : '');
 
   const time = new Date(msg.timestamp || Date.now()).toLocaleTimeString('en-US', {
     hour: '2-digit', minute: '2-digit', hour12: true
   });
 
-  const checkSvg = '<svg class="msg-check" width="16" height="11" viewBox="0 0 16 11" fill="none"><path d="M1 5.5L4.5 9L11 1.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 5.5L8.5 9L15 1.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  // WhatsApp Double Checks (Single = sent, Double = delivered, Double Blue = read)
+  const isRead = isOwn && onlineUsersCount > 1;
+  const checkSvg = `
+    <svg class="msg-check ${isRead ? 'read' : 'delivered'}" width="16" height="11" viewBox="0 0 16 11" fill="none">
+      <path d="M1 5.5L4.5 9L11 1.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M5 5.5L8.5 9L15 1.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  `;
 
   const metaHtml = '<div class="message-meta"><span class="message-time">' + time + '</span>' + (isOwn ? checkSvg : '') + '</div>';
 
   let html = '';
+
+  // Hover Action Buttons (Reaction, Reply, Copy, Delete)
+  html += `
+    <div class="msg-actions-hover">
+      <button class="msg-action-btn btn-react" title="React" data-id="${msg.id}">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
+      </button>
+      <button class="msg-action-btn btn-reply" title="Reply" data-id="${msg.id}">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
+      </button>
+      <button class="msg-action-btn btn-copy" title="Copy" data-text="${escapeHtml(msg.text || '')}">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+      </button>
+      <button class="msg-action-btn btn-del" title="Delete" data-id="${msg.id}" data-own="${isOwn}">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+      </button>
+    </div>
+  `;
 
   if (!isOwn) {
     html += '<div class="message-sender"><span class="sender-dot"></span>' + escapeHtml(msg.sender) + '</div>';
@@ -306,24 +522,82 @@ function renderMessage(msg) {
 
   html += '<div class="message-bubble">';
 
-  if (msg.videoUrl || msg.type === 'video') {
+  // WhatsApp Quoted Reply Block
+  if (msg.replyTo) {
+    html += `
+      <div class="msg-quote" data-target="${escapeHtml(msg.replyTo.id)}">
+        <span class="msg-quote-sender">${escapeHtml(msg.replyTo.sender)}</span>
+        <span class="msg-quote-text">${escapeHtml(msg.replyTo.text || 'Media')}</span>
+      </div>
+    `;
+  }
+
+  // Content
+  if (msg.deleted) {
+    html += '<p class="bubble-text" style="opacity:0.65;font-style:italic;">🚫 This message was deleted</p>';
+  } else if (msg.type === 'audio' || msg.audioUrl) {
+    // WhatsApp Voice Note Player
+    html += `
+      <div class="voice-note-player" data-audio="${escapeHtml(msg.audioUrl)}">
+        <button class="vn-play-btn" title="Play Voice Note">
+          <svg class="play-icon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+          <svg class="pause-icon hidden" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+        </button>
+        <div class="vn-waveform-wrap">
+          <input type="range" class="vn-slider" min="0" max="100" value="0" />
+          <div class="vn-meta-row">
+            <span class="vn-duration">${msg.duration ? formatDuration(msg.duration) : 'Voice note'}</span>
+            <button class="vn-speed-btn" title="Playback Speed">1x</button>
+          </div>
+        </div>
+      </div>
+    `;
+    if (msg.text) html += '<p class="bubble-caption">' + formatText(msg.text) + '</p>';
+  } else if (msg.videoUrl || msg.type === 'video') {
     html += '<div class="message-video-wrap">';
     html += '<video src="' + escapeHtml(msg.videoUrl) + '" controls playsinline preload="metadata" class="message-video"></video>';
+    html += '<div class="media-overlay-actions">';
     html += '<button class="media-dl-btn" title="Download Video" data-dl="' + escapeHtml(msg.videoUrl) + '" data-ext="mp4">';
     html += '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
     html += '</button>';
+    html += '<button class="media-del-btn" title="Delete Video" data-id="' + msg.id + '" data-own="' + isOwn + '">';
+    html += '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
+    html += '</button>';
+    html += '</div>';
     html += '</div>';
     if (msg.text) html += '<p class="bubble-caption">' + formatText(msg.text) + '</p>';
   } else if (msg.imageUrl || msg.type === 'image') {
     html += '<div class="message-image-wrap">';
     html += '<img src="' + escapeHtml(msg.imageUrl) + '" class="message-image" alt="Shared image" loading="lazy" />';
+    html += '<div class="media-overlay-actions">';
     html += '<button class="media-dl-btn" title="Download Photo" data-dl="' + escapeHtml(msg.fullImageUrl || msg.imageUrl) + '" data-ext="jpg">';
     html += '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
     html += '</button>';
+    html += '<button class="media-del-btn" title="Delete Photo" data-id="' + msg.id + '" data-own="' + isOwn + '">';
+    html += '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
+    html += '</button>';
+    html += '</div>';
     html += '</div>';
     if (msg.text) html += '<p class="bubble-caption">' + formatText(msg.text) + '</p>';
   } else {
     html += '<p class="bubble-text">' + formatText(msg.text) + '</p>';
+  }
+
+  // Reactions Chips
+  if (msg.reactions) {
+    const reactionCounts = {};
+    let myReaction = null;
+    Object.entries(msg.reactions).forEach(([user, emoji]) => {
+      reactionCounts[emoji] = (reactionCounts[emoji] || 0) + 1;
+      if (user === currentUser) myReaction = emoji;
+    });
+
+    html += '<div class="msg-reactions-chips">';
+    Object.entries(reactionCounts).forEach(([emoji, count]) => {
+      const isMine = myReaction === emoji;
+      html += `<span class="reaction-chip ${isMine ? 'own-reacted' : ''}" data-emoji="${emoji}">${emoji} ${count > 1 ? count : ''}</span>`;
+    });
+    html += '</div>';
   }
 
   html += metaHtml;
@@ -331,29 +605,378 @@ function renderMessage(msg) {
 
   div.innerHTML = html;
 
+  // Event Listeners on Message
+  attachMessageEventListeners(div, msg);
+
+  messagesList.appendChild(div);
+}
+
+function formatDuration(sec) {
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${m}:${s < 10 ? '0' : ''}${s}`;
+}
+
+function attachMessageEventListeners(div, msg) {
+  const isOwn = msg.sender === currentUser;
+
+  // Lightbox click on images
   const img = div.querySelector('.message-image');
   if (img) {
-    img.addEventListener('click', () => openLightbox(msg.fullImageUrl || msg.imageUrl));
+    img.addEventListener('click', () => openLightbox(msg.fullImageUrl || msg.imageUrl, msg.id, isOwn));
   }
 
+  // Media download
   const dlBtn = div.querySelector('.media-dl-btn');
   if (dlBtn) {
     dlBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const url = dlBtn.getAttribute('data-dl');
-      const ext = dlBtn.getAttribute('data-ext') || 'bin';
+      const ext = dlBtn.getAttribute('data-ext') || 'jpg';
       downloadMedia(url, `chatttt_${Date.now()}.${ext}`);
     });
   }
 
-  messagesList.appendChild(div);
+  // Media delete button
+  const mediaDelBtn = div.querySelector('.media-del-btn');
+  if (mediaDelBtn) {
+    mediaDelBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      promptDeleteMessage(msg.id, isOwn);
+    });
+  }
+
+  // Click on quoted reply to jump
+  const quoteEl = div.querySelector('.msg-quote');
+  if (quoteEl) {
+    quoteEl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const targetId = quoteEl.getAttribute('data-target');
+      const targetEl = document.getElementById('msg-' + targetId);
+      if (targetEl) {
+        targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        targetEl.classList.remove('highlight-flash');
+        void targetEl.offsetWidth;
+        targetEl.classList.add('highlight-flash');
+      } else {
+        showToast('Original message not found');
+      }
+    });
+  }
+
+  // Reply button
+  const replyBtn = div.querySelector('.btn-reply');
+  if (replyBtn) {
+    replyBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      setReplyMessage(msg);
+    });
+  }
+
+  // Copy button
+  const copyBtn = div.querySelector('.btn-copy');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const text = copyBtn.getAttribute('data-text');
+      if (text) {
+        try {
+          await navigator.clipboard.writeText(text);
+          showToast('Copied to clipboard! 📋');
+        } catch {
+          showToast('Could not copy text');
+        }
+      }
+    });
+  }
+
+  // Delete button
+  const delBtn = div.querySelector('.btn-del');
+  if (delBtn) {
+    delBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      promptDeleteMessage(msg.id, isOwn);
+    });
+  }
+
+  // Reaction button & picker popup
+  const reactBtn = div.querySelector('.btn-react');
+  if (reactBtn) {
+    reactBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      showReactionPicker(div, msg.id);
+    });
+  }
+
+  // Reaction chips click to toggle
+  const chips = div.querySelectorAll('.reaction-chip');
+  chips.forEach(chip => {
+    chip.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const emoji = chip.getAttribute('data-emoji');
+      toggleReaction(msg.id, emoji);
+    });
+  });
+
+  // Voice Note Player logic
+  const vnPlayer = div.querySelector('.voice-note-player');
+  if (vnPlayer) {
+    setupVoiceNotePlayer(vnPlayer);
+  }
+
+  // Mobile Swipe-Right to Reply
+  let touchStartX = 0;
+  let touchDeltaX = 0;
+  div.addEventListener('touchstart', (e) => {
+    touchStartX = e.touches[0].clientX;
+    touchDeltaX = 0;
+  }, { passive: true });
+
+  div.addEventListener('touchmove', (e) => {
+    touchDeltaX = e.touches[0].clientX - touchStartX;
+    if (touchDeltaX > 15 && touchDeltaX < 90) {
+      div.style.transform = `translateX(${touchDeltaX}px)`;
+    }
+  }, { passive: true });
+
+  div.addEventListener('touchend', () => {
+    if (touchDeltaX > 55) {
+      setReplyMessage(msg);
+      if (navigator.vibrate) navigator.vibrate(15);
+    }
+    div.style.transform = '';
+  });
 }
 
+function showReactionPicker(msgDiv, msgId) {
+  // Remove existing popups
+  document.querySelectorAll('.reactions-bar-popup').forEach(p => p.remove());
+
+  const popup = document.createElement('div');
+  popup.className = 'reactions-bar-popup';
+  const quickEmojis = ['👍', '❤️', '😂', '😮', '😢', '🙏', '🔥', '👏'];
+
+  quickEmojis.forEach(emoji => {
+    const span = document.createElement('span');
+    span.className = 'reaction-pick-emoji';
+    span.textContent = emoji;
+    span.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleReaction(msgId, emoji);
+      popup.remove();
+    });
+    popup.appendChild(span);
+  });
+
+  msgDiv.appendChild(popup);
+
+  const closePopup = (e) => {
+    if (!popup.contains(e.target)) {
+      popup.remove();
+      document.removeEventListener('click', closePopup);
+    }
+  };
+  setTimeout(() => document.addEventListener('click', closePopup), 0);
+}
+
+function setupVoiceNotePlayer(container) {
+  const audioUrl = container.getAttribute('data-audio');
+  if (!audioUrl) return;
+
+  const playBtn = container.querySelector('.vn-play-btn');
+  const playIcon = container.querySelector('.play-icon');
+  const pauseIcon = container.querySelector('.pause-icon');
+  const slider = container.querySelector('.vn-slider');
+  const durationEl = container.querySelector('.vn-duration');
+  const speedBtn = container.querySelector('.vn-speed-btn');
+
+  let audio = new Audio(audioUrl);
+  let speeds = [1, 1.5, 2];
+  let speedIdx = 0;
+
+  audio.addEventListener('loadedmetadata', () => {
+    if (audio.duration && !isNaN(audio.duration)) {
+      durationEl.textContent = formatDuration(audio.duration);
+    }
+  });
+
+  audio.addEventListener('timeupdate', () => {
+    if (audio.duration) {
+      slider.value = (audio.currentTime / audio.duration) * 100;
+      durationEl.textContent = `${formatDuration(audio.currentTime)} / ${formatDuration(audio.duration)}`;
+    }
+  });
+
+  audio.addEventListener('ended', () => {
+    playIcon.classList.remove('hidden');
+    pauseIcon.classList.add('hidden');
+    slider.value = 0;
+    if (audio.duration) durationEl.textContent = formatDuration(audio.duration);
+  });
+
+  playBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (activeAudio && activeAudio !== audio) {
+      activeAudio.pause();
+    }
+    if (audio.paused) {
+      activeAudio = audio;
+      audio.play().then(() => {
+        playIcon.classList.add('hidden');
+        pauseIcon.classList.remove('hidden');
+      }).catch(err => {
+        console.error('Audio play error:', err);
+        showToast('Could not play audio');
+      });
+    } else {
+      audio.pause();
+      playIcon.classList.remove('hidden');
+      pauseIcon.classList.add('hidden');
+    }
+  });
+
+  slider.addEventListener('input', (e) => {
+    e.stopPropagation();
+    if (audio.duration) {
+      audio.currentTime = (slider.value / 100) * audio.duration;
+    }
+  });
+
+  if (speedBtn) {
+    speedBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      speedIdx = (speedIdx + 1) % speeds.length;
+      audio.playbackRate = speeds[speedIdx];
+      speedBtn.textContent = speeds[speedIdx] + 'x';
+    });
+  }
+}
+
+function setReplyMessage(msg) {
+  currentReply = {
+    id: msg.id,
+    sender: msg.sender || 'Unknown',
+    text: msg.text || (msg.imageUrl ? '📷 Photo' : (msg.videoUrl ? '🎥 Video' : (msg.audioUrl ? '🎤 Voice note' : 'Message'))),
+    type: msg.type || 'text'
+  };
+  replySender.textContent = currentReply.sender;
+  replyText.textContent = currentReply.text;
+  replyBar.classList.remove('hidden');
+  messageInput.focus();
+}
+
+function cancelReply() {
+  currentReply = null;
+  replyBar.classList.add('hidden');
+}
+
+if (cancelReplyBtn) {
+  cancelReplyBtn.addEventListener('click', cancelReply);
+}
+
+function toggleReaction(msgId, emoji) {
+  if (!currentRoom || !currentUser || !msgId) return;
+  const reactionRef = db.ref(`messages/${currentRoom}/${msgId}/reactions/${currentUser}`);
+  reactionRef.once('value', (snap) => {
+    if (snap.val() === emoji) {
+      reactionRef.remove();
+    } else {
+      reactionRef.set(emoji);
+    }
+  });
+}
+
+let pendingDeleteId = null;
+let pendingDeleteIsOwn = false;
+
+function promptDeleteMessage(msgId, isOwn) {
+  pendingDeleteId = msgId;
+  pendingDeleteIsOwn = isOwn;
+
+  if (deleteModal) {
+    if (deleteForEveryoneBtn) {
+      deleteForEveryoneBtn.classList.toggle('hidden', !isOwn);
+    }
+    deleteModal.classList.remove('hidden');
+  } else {
+    if (isOwn) {
+      const choice = confirm('Delete message for everyone?\nClick Cancel to delete only for you.');
+      deleteMessage(msgId, choice);
+    } else {
+      if (confirm('Delete this message for yourself?')) {
+        deleteMessage(msgId, false);
+      }
+    }
+  }
+}
+
+function hideDeleteModal() {
+  if (deleteModal) deleteModal.classList.add('hidden');
+  pendingDeleteId = null;
+}
+
+if (deleteForEveryoneBtn) {
+  deleteForEveryoneBtn.addEventListener('click', () => {
+    if (pendingDeleteId) {
+      deleteMessage(pendingDeleteId, true);
+      hideDeleteModal();
+    }
+  });
+}
+
+if (deleteForMeBtn) {
+  deleteForMeBtn.addEventListener('click', () => {
+    if (pendingDeleteId) {
+      deleteMessage(pendingDeleteId, false);
+      hideDeleteModal();
+    }
+  });
+}
+
+if (deleteCancelBtn) {
+  deleteCancelBtn.addEventListener('click', hideDeleteModal);
+}
+
+if (deleteModal) {
+  deleteModal.querySelector('.modal-backdrop')?.addEventListener('click', hideDeleteModal);
+}
+
+function deleteMessage(msgId, forEveryone) {
+  if (!msgId) return;
+  if (forEveryone) {
+    db.ref(`messages/${currentRoom}/${msgId}`).remove()
+      .then(() => showToast('Message deleted for everyone 🗑️'))
+      .catch((err) => {
+        console.error('Delete error:', err);
+        showToast('Failed to delete message');
+      });
+  } else {
+    const key = 'deleted_msgs_' + currentRoom;
+    const local = JSON.parse(localStorage.getItem(key) || '[]');
+    if (!local.includes(msgId)) {
+      local.push(msgId);
+      localStorage.setItem(key, JSON.stringify(local));
+    }
+    const el = document.getElementById('msg-' + msgId);
+    if (el) el.remove();
+    showToast('Message deleted for you 🗑️');
+  }
+}
+
+// WhatsApp Markdown Format & Linkify
 function formatText(text) {
   if (!text) return '';
   let s = escapeHtml(text);
-  s = s.replace(/\*(.+?)\*/g, '<strong>$1</strong>');
-  s = s.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener" style="color:var(--accent-light);text-decoration:underline">$1</a>');
+  // Code block ```code```
+  s = s.replace(/```([\s\S]+?)```/g, '<code>$1</code>');
+  // Bold *text*
+  s = s.replace(/\*([^*\n]+?)\*/g, '<strong>$1</strong>');
+  // Italic _text_
+  s = s.replace(/\b_([^_]+?)_\b/g, '<em>$1</em>');
+  // Strikethrough ~text~
+  s = s.replace(/~([^~]+?)~/g, '<del>$1</del>');
+  // URLs auto-link
+  s = s.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener" style="color:var(--accent-light);text-decoration:underline;">$1</a>');
   return s;
 }
 
@@ -363,7 +986,12 @@ function escapeHtml(text) {
   return d.innerHTML;
 }
 
+// ============================================
+// SEND MESSAGE & MEDIA (Keypad Stays Open!)
+// ============================================
 function sendMessage() {
+  if (isSendingMedia) return;
+
   const text = messageInput.value.trim();
   if (!text && !selectedMediaFile) return;
 
@@ -372,65 +1000,107 @@ function sendMessage() {
     return;
   }
 
-  db.ref('messages/' + currentRoom).push({
+  const msgData = {
     sender: currentUser,
     text: text,
     type: 'text',
     timestamp: Date.now()
-  });
+  };
+
+  if (currentReply) {
+    msgData.replyTo = currentReply;
+  }
+
+  db.ref('messages/' + currentRoom).push(msgData);
 
   messageInput.value = '';
-  sendBtn.disabled = true;
+  cancelReply();
+  updateInputButtonState();
   clearTyping();
+  playSentSound();
+
+  // Keep focus on input so keyboard stays open
+  messageInput.focus();
 }
 
 async function sendMediaMessage(caption) {
+  if (isSendingMedia || !selectedMediaFile) return;
+  isSendingMedia = true;
+
+  // Immediate visual feedback on Send button
+  sendBtn.disabled = true;
+  sendBtn.classList.add('sending');
+  sendBtn.innerHTML = `
+    <svg class="send-spinner" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+      <circle cx="12" cy="12" r="10" stroke-opacity="0.25" stroke="currentColor"/>
+      <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor"/>
+    </svg>
+  `;
+
   uploadProgress.classList.remove('hidden');
   uploadBar.style.width = '0%';
+  if (uploadStatusText) uploadStatusText.textContent = 'Preparing media...';
+  if (previewFilesize) previewFilesize.textContent = 'Uploading... please wait';
+  if (cancelImageBtn) cancelImageBtn.style.pointerEvents = 'none';
 
   try {
     const isVideo = selectedMediaFile.type.startsWith('video/');
     let fileToUpload = selectedMediaFile;
+
     if (!isVideo) {
+      if (uploadStatusText) uploadStatusText.textContent = 'Optimizing image...';
       fileToUpload = await compressImage(selectedMediaFile);
     }
 
+    if (uploadStatusText) uploadStatusText.textContent = 'Uploading 0%...';
     const result = await uploadToCloudinary(fileToUpload, (percent) => {
       uploadBar.style.width = percent + '%';
+      if (uploadStatusText) uploadStatusText.textContent = `Uploading ${percent}%`;
     });
 
+    const msgData = {
+      sender: currentUser,
+      text: caption || '',
+      timestamp: Date.now()
+    };
+
+    if (currentReply) {
+      msgData.replyTo = currentReply;
+    }
+
     if (isVideo) {
-      db.ref('messages/' + currentRoom).push({
-        sender: currentUser,
-        text: caption || '',
-        videoUrl: result.url,
-        type: 'video',
-        timestamp: Date.now()
-      });
+      msgData.videoUrl = result.url;
+      msgData.type = 'video';
+      db.ref('messages/' + currentRoom).push(msgData);
       showToast('Video sent! 🎥');
     } else {
-      db.ref('messages/' + currentRoom).push({
-        sender: currentUser,
-        text: caption || '',
-        imageUrl: result.thumbnail,
-        fullImageUrl: result.url,
-        type: 'image',
-        timestamp: Date.now()
-      });
+      msgData.imageUrl = result.thumbnail;
+      msgData.fullImageUrl = result.url;
+      msgData.type = 'image';
+      db.ref('messages/' + currentRoom).push(msgData);
       showToast('Image sent! 📸');
     }
 
     cancelMediaPreview();
+    cancelReply();
     messageInput.value = '';
-    sendBtn.disabled = true;
+    playSentSound();
+    messageInput.focus();
   } catch (err) {
     console.error('Upload error:', err);
-    showToast('Failed to upload. Tap send to try again.');
-    // Re-enable send button so user can retry
-    sendBtn.disabled = false;
+    showToast('Upload failed after retries. Tap send to try again.');
+    if (uploadStatusText) uploadStatusText.textContent = 'Failed. Tap send to retry.';
+    if (previewFilesize) previewFilesize.textContent = 'Failed • Tap Send to retry';
+  } finally {
+    isSendingMedia = false;
+    if (cancelImageBtn) cancelImageBtn.style.pointerEvents = '';
+    sendBtn.classList.remove('sending');
+    sendBtn.innerHTML = `
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+    `;
+    updateInputButtonState();
+    uploadProgress.classList.add('hidden');
   }
-
-  uploadProgress.classList.add('hidden');
 }
 
 function sendSystemMessage(text) {
@@ -441,85 +1111,171 @@ function sendSystemMessage(text) {
   });
 }
 
-function scrollToBottom() {
+function scrollToBottom(smooth = false) {
   requestAnimationFrame(() => {
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    if (!messagesContainer) return;
+    if (smooth) {
+      messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
+    } else {
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    }
   });
 }
 
 // ============================================
-// CLOUDINARY UPLOAD
+// RESILIENT CLOUDINARY UPLOAD WITH RETRY
 // ============================================
-function uploadToCloudinary(file, onProgress) {
+function uploadToCloudinary(file, onProgress, attempt = 1, maxAttempts = 3) {
   return new Promise((resolve, reject) => {
     const isVideo = file.type.startsWith('video/');
-    const endpoint = isVideo ? 'video/upload' : 'image/upload';
+    const isAudio = file.type.startsWith('audio/');
+    const endpoint = (isVideo || isAudio) ? 'video/upload' : 'image/upload';
     const formData = new FormData();
     formData.append('file', file);
     formData.append('upload_preset', UPLOAD_PRESET);
     formData.append('folder', 'chatttt');
 
     const xhr = new XMLHttpRequest();
+    xhr.timeout = 45000;
     xhr.open('POST', `https://api.cloudinary.com/v1_1/${CLOUD_NAME}/${endpoint}`);
 
-    xhr.upload.addEventListener('progress', (e) => {
-      if (e.lengthComputable && onProgress) {
-        onProgress(Math.round((e.loaded / e.total) * 100));
-      }
-    });
+    if (xhr.upload && onProgress) {
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) {
+          onProgress(Math.round((e.loaded / e.total) * 100));
+        }
+      });
+    }
 
     xhr.addEventListener('load', () => {
-      if (xhr.status === 200) {
-        const res = JSON.parse(xhr.responseText);
-        resolve({
-          url: res.secure_url,
-          thumbnail: isVideo ? res.secure_url : res.secure_url.replace('/upload/', '/upload/w_400,q_auto,f_auto/'),
-          isVideo: isVideo
-        });
-      } else {
+      if (xhr.status >= 200 && xhr.status < 300) {
         try {
-          const errRes = JSON.parse(xhr.responseText);
-          reject(new Error(errRes.error?.message || 'Upload failed'));
+          const res = JSON.parse(xhr.responseText);
+          resolve({
+            url: res.secure_url,
+            thumbnail: (isVideo || isAudio) ? res.secure_url : res.secure_url.replace('/upload/', '/upload/w_500,q_auto,f_auto/'),
+            isVideo,
+            isAudio
+          });
         } catch (_) {
-          reject(new Error('Upload failed'));
+          retryOrReject(new Error('Invalid JSON response'));
         }
+      } else {
+        retryOrReject(new Error('Upload failed: ' + xhr.status));
       }
     });
 
-    xhr.addEventListener('error', () => reject(new Error('Upload failed')));
+    xhr.addEventListener('error', () => retryOrReject(new Error('Network error')));
+    xhr.addEventListener('timeout', () => retryOrReject(new Error('Upload timed out')));
+
+    function retryOrReject(err) {
+      if (attempt < maxAttempts) {
+        console.warn(`Upload attempt ${attempt} failed, retrying...`, err);
+        if (uploadStatusText) {
+          uploadStatusText.textContent = `Retrying (${attempt + 1}/${maxAttempts})...`;
+        }
+        setTimeout(() => {
+          uploadToCloudinary(file, onProgress, attempt + 1, maxAttempts).then(resolve).catch(reject);
+        }, attempt * 1000);
+      } else {
+        reject(err);
+      }
+    }
+
     xhr.send(formData);
   });
 }
 
+// Safe Image Compression that NEVER Hangs
 function compressImage(file) {
   return new Promise((resolve) => {
-    if (file.size < 500 * 1024) { resolve(file); return; }
+    if (!file.type.startsWith('image/') || file.type === 'image/gif' || file.size < 350 * 1024) {
+      resolve(file);
+      return;
+    }
 
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
     const img = new Image();
+    const blobUrl = URL.createObjectURL(file);
+    let isSettled = false;
 
-    img.onload = () => {
-      let w = img.width, h = img.height;
-      const maxW = 1200;
-      if (w > maxW) { h = (h * maxW) / w; w = maxW; }
-      canvas.width = w;
-      canvas.height = h;
-      ctx.drawImage(img, 0, 0, w, h);
-      canvas.toBlob((blob) => {
-        resolve(new File([blob], file.name, { type: 'image/jpeg' }));
-      }, 'image/jpeg', 0.8);
+    const safeFallback = () => {
+      if (isSettled) return;
+      isSettled = true;
+      try { URL.revokeObjectURL(blobUrl); } catch (_) {}
+      resolve(file); // Graceful fallback to original file
     };
 
-    img.src = URL.createObjectURL(file);
+    img.onerror = safeFallback;
+
+    img.onload = () => {
+      try {
+        let w = img.naturalWidth || img.width;
+        let h = img.naturalHeight || img.height;
+        const maxDim = 1600;
+        if (w > maxDim || h > maxDim) {
+          if (w > h) {
+            h = Math.round((h * maxDim) / w);
+            w = maxDim;
+          } else {
+            w = Math.round((w * maxDim) / h);
+            h = maxDim;
+          }
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) { safeFallback(); return; }
+
+        ctx.drawImage(img, 0, 0, w, h);
+        canvas.toBlob((blob) => {
+          if (isSettled) return;
+          isSettled = true;
+          try { URL.revokeObjectURL(blobUrl); } catch (_) {}
+          if (blob && blob.size < file.size) {
+            resolve(new File([blob], file.name.replace(/\.[^.]+$/, '.jpg'), { type: 'image/jpeg' }));
+          } else {
+            resolve(file);
+          }
+        }, 'image/jpeg', 0.82);
+      } catch (_) {
+        safeFallback();
+      }
+    };
+
+    setTimeout(safeFallback, 4000);
+    img.src = blobUrl;
   });
 }
 
 // ============================================
-// MESSAGE INPUT HANDLERS
+// MESSAGE INPUT & BUTTON SWITCHING
 // ============================================
+function updateInputButtonState() {
+  if (isSendingMedia) {
+    sendBtn.classList.remove('hidden');
+    sendBtn.disabled = true;
+    voiceRecordBtn.classList.add('hidden');
+    return;
+  }
+
+  const hasText = messageInput.value.trim().length > 0;
+  const hasMedia = !!selectedMediaFile;
+
+  if (hasText || hasMedia) {
+    sendBtn.classList.remove('hidden');
+    sendBtn.disabled = false;
+    voiceRecordBtn.classList.add('hidden');
+  } else {
+    sendBtn.classList.add('hidden');
+    sendBtn.disabled = true;
+    voiceRecordBtn.classList.remove('hidden');
+  }
+}
+
 messageInput.addEventListener('input', () => {
-  sendBtn.disabled = !messageInput.value.trim() && !selectedMediaFile;
+  updateInputButtonState();
   updateTyping();
 });
 
@@ -530,7 +1286,152 @@ messageInput.addEventListener('keydown', (e) => {
   }
 });
 
-sendBtn.addEventListener('click', sendMessage);
+// Prevent desktop clicks on auxiliary buttons from blurring the input
+[emojiBtn, cancelReplyBtn].forEach(el => {
+  if (!el) return;
+  el.addEventListener('mousedown', (e) => {
+    if (document.activeElement === messageInput) {
+      e.preventDefault();
+    }
+  });
+});
+
+sendBtn.addEventListener('click', (e) => {
+  e.preventDefault();
+  sendMessage();
+});
+
+// Clipboard Paste (Supports Text and Direct Image Paste)
+messageInput.addEventListener('paste', async (e) => {
+  const clipboardData = e.clipboardData || window.clipboardData;
+  if (!clipboardData) return;
+
+  const items = clipboardData.items;
+  if (items) {
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.startsWith('image/')) {
+        const file = items[i].getAsFile();
+        if (file) {
+          e.preventDefault();
+          handleSelectedFile(file);
+          showToast('Image pasted from clipboard! 📋');
+          return;
+        }
+      }
+    }
+  }
+
+  setTimeout(() => {
+    updateInputButtonState();
+    updateTyping();
+  }, 0);
+});
+
+// ============================================
+// WHATSAPP VOICE NOTE RECORDING
+// ============================================
+voiceRecordBtn.addEventListener('click', () => {
+  startVoiceRecording();
+});
+
+async function startVoiceRecording() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recordedAudioChunks = [];
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : (MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : '');
+    mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) recordedAudioChunks.push(e.data);
+    };
+
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+    };
+
+    mediaRecorder.start(200);
+    recordingStartTime = Date.now();
+    voiceRecordBar.classList.remove('hidden');
+    mainInputRow.classList.add('hidden');
+
+    recordingTimerInterval = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - recordingStartTime) / 1000);
+      const m = Math.floor(elapsed / 60);
+      const s = elapsed % 60;
+      voiceRecordTimer.textContent = `${m}:${s < 10 ? '0' : ''}${s}`;
+    }, 250);
+
+    playSentSound();
+  } catch (err) {
+    console.error('Microphone error:', err);
+    showToast('Please grant microphone access to record voice notes');
+  }
+}
+
+function cancelVoiceRecording() {
+  if (recordingTimerInterval) {
+    clearInterval(recordingTimerInterval);
+    recordingTimerInterval = null;
+  }
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
+  }
+  recordedAudioChunks = [];
+  voiceRecordBar.classList.add('hidden');
+  mainInputRow.classList.remove('hidden');
+  voiceRecordTimer.textContent = '0:00';
+  updateInputButtonState();
+}
+
+if (cancelVoiceRecordBtn) {
+  cancelVoiceRecordBtn.addEventListener('click', cancelVoiceRecording);
+}
+
+if (sendVoiceRecordBtn) {
+  sendVoiceRecordBtn.addEventListener('click', async () => {
+    if (!mediaRecorder) return;
+    const durationSec = Math.max(1, Math.floor((Date.now() - recordingStartTime) / 1000));
+
+    if (recordingTimerInterval) {
+      clearInterval(recordingTimerInterval);
+      recordingTimerInterval = null;
+    }
+
+    mediaRecorder.onstop = async () => {
+      const blob = new Blob(recordedAudioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+      const file = new File([blob], `voice_${Date.now()}.webm`, { type: blob.type });
+
+      voiceRecordBar.classList.add('hidden');
+      mainInputRow.classList.remove('hidden');
+      voiceRecordTimer.textContent = '0:00';
+      showToast('Sending voice note... 🎙️');
+
+      try {
+        const res = await uploadToCloudinary(file, null);
+        const msgData = {
+          sender: currentUser,
+          type: 'audio',
+          audioUrl: res.url,
+          duration: durationSec,
+          timestamp: Date.now()
+        };
+        if (currentReply) {
+          msgData.replyTo = currentReply;
+        }
+        db.ref('messages/' + currentRoom).push(msgData);
+        cancelReply();
+        playSentSound();
+        showToast('Voice note sent! 🎵');
+      } catch (err) {
+        console.error('Voice upload failed:', err);
+        showToast('Failed to send voice note');
+      }
+      updateInputButtonState();
+    };
+
+    mediaRecorder.stop();
+  });
+}
 
 // ============================================
 // TYPING INDICATOR
@@ -579,7 +1480,7 @@ function listenForTyping() {
       e.stopPropagation();
       messageInput.value += emoji;
       messageInput.focus();
-      sendBtn.disabled = false;
+      updateInputButtonState();
     });
     emojiGrid.appendChild(btn);
   });
@@ -599,12 +1500,20 @@ document.addEventListener('click', (e) => {
 });
 
 // ============================================
-// MEDIA UPLOAD (Photo & Video)
+// MEDIA UPLOAD & PREVIEW (Photos & Videos)
 // ============================================
+// Always reset file input value on click so selecting same file works
+imageInput.addEventListener('click', () => {
+  imageInput.value = '';
+});
+
 imageInput.addEventListener('change', (e) => {
   const file = e.target.files[0];
   if (!file) return;
+  handleSelectedFile(file);
+});
 
+function handleSelectedFile(file) {
   const isVideo = file.type.startsWith('video/');
   const isImage = file.type.startsWith('image/');
 
@@ -613,13 +1522,19 @@ imageInput.addEventListener('change', (e) => {
     return;
   }
 
-  const maxSize = isVideo ? 200 * 1024 * 1024 : 15 * 1024 * 1024;
+  const maxSize = isVideo ? 200 * 1024 * 1024 : 30 * 1024 * 1024;
   if (file.size > maxSize) {
-    showToast(isVideo ? 'Video too large. Max 200MB.' : 'Image too large. Max 15MB.');
+    showToast(isVideo ? 'Video too large. Max 200MB.' : 'Image too large. Max 30MB.');
     return;
   }
 
   selectedMediaFile = file;
+
+  if (previewFilename) previewFilename.textContent = file.name;
+  if (previewFilesize) {
+    const mb = (file.size / (1024 * 1024)).toFixed(1);
+    previewFilesize.textContent = mb + ' MB • Ready to send';
+  }
 
   if (isVideo) {
     previewImg.classList.add('hidden');
@@ -635,10 +1550,10 @@ imageInput.addEventListener('change', (e) => {
   }
 
   imagePreview.classList.remove('hidden');
-  sendBtn.disabled = false;
+  updateInputButtonState();
   messageInput.placeholder = isVideo ? 'Add a video caption...' : 'Add a photo caption...';
   messageInput.focus();
-});
+}
 
 cancelImageBtn.addEventListener('click', cancelMediaPreview);
 
@@ -654,7 +1569,7 @@ function cancelMediaPreview() {
   }
   imageInput.value = '';
   messageInput.placeholder = 'Type a message...';
-  sendBtn.disabled = !messageInput.value.trim();
+  updateInputButtonState();
 }
 
 // ============================================
@@ -693,9 +1608,13 @@ async function downloadMedia(url, filename) {
 // LIGHTBOX
 // ============================================
 let currentLightboxUrl = '';
+let currentLightboxMsgId = null;
+let currentLightboxIsOwn = false;
 
-function openLightbox(url) {
+function openLightbox(url, msgId, isOwn) {
   currentLightboxUrl = url;
+  currentLightboxMsgId = msgId;
+  currentLightboxIsOwn = isOwn;
   lightboxImg.src = url;
   lightbox.classList.remove('hidden');
 }
@@ -704,6 +1623,15 @@ if (lightboxDownload) {
   lightboxDownload.addEventListener('click', () => {
     if (currentLightboxUrl) {
       downloadMedia(currentLightboxUrl, `chatttt_${Date.now()}.jpg`);
+    }
+  });
+}
+
+if (lightboxDelete) {
+  lightboxDelete.addEventListener('click', () => {
+    if (currentLightboxMsgId) {
+      lightbox.classList.add('hidden');
+      promptDeleteMessage(currentLightboxMsgId, currentLightboxIsOwn);
     }
   });
 }
@@ -1318,18 +2246,37 @@ function showToast(message) {
 }
 
 // ============================================
-// MOBILE & HASH HANDLING
+// MOBILE KEYBOARD & VISUAL VIEWPORT (Zero Shatter!)
 // ============================================
-if (/Mobi|Android/i.test(navigator.userAgent)) {
-  messageInput.addEventListener('focus', () => setTimeout(scrollToBottom, 300));
-
+function setupVisualViewport() {
   if (window.visualViewport) {
-    window.visualViewport.addEventListener('resize', () => {
-      document.documentElement.style.setProperty('--vh', window.visualViewport.height * 0.01 + 'px');
-      scrollToBottom();
-    });
+    const updateViewport = () => {
+      const vh = window.visualViewport.height;
+      document.documentElement.style.setProperty('--vvh', `${vh}px`);
+      if (isNearBottom) {
+        scrollToBottom(false);
+      }
+    };
+    window.visualViewport.addEventListener('resize', updateViewport);
+    window.visualViewport.addEventListener('scroll', updateViewport);
+    updateViewport();
+  } else {
+    const setFallback = () => {
+      document.documentElement.style.setProperty('--vvh', `${window.innerHeight}px`);
+    };
+    window.addEventListener('resize', setFallback);
+    setFallback();
   }
+
+  // Input focus adjustment without fighting browser keyboard animation
+  messageInput.addEventListener('focus', () => {
+    setTimeout(() => {
+      if (isNearBottom) scrollToBottom(false);
+    }, 120);
+  });
 }
+
+setupVisualViewport();
 
 // Auto-fill room from URL hash (e.g., http://localhost:3000/#myroom)
 if (window.location.hash) {

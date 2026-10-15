@@ -4,9 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --host",
+    "dev": "node server.js",
+    "start": "node server.js",
     "build": "cp app.js public/app.js && cp style.css public/style.css && vite build",
-    "preview": "vite preview"
+    "preview": "node server.js"
   },
   "dependencies": {
     "firebase": "^10.14.0"
