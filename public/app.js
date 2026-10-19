@@ -76,6 +76,21 @@ const ICE_SERVERS = {
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
   ]
 };
 
@@ -1736,7 +1751,7 @@ let localStream = null;
 let isInCall = false;
 let isJoiningCall = false; // guard against ringtone race during async join
 let isMicMuted = false;
-let isSpeakerOn = true; // speaker starts ON (unmuted)
+let isSpeakerMode = false; // false = Earpiece (Ear / Normal call mode), true = Speakerphone (Loudspeaker)
 let callStartTime = null;
 let callTimerInterval = null;
 let currentCallParticipants = {};
@@ -1787,6 +1802,73 @@ function getPairKey(user1, user2) {
   return [user1, user2].sort().join('___');
 }
 
+// Route audio element to earpiece (handset receiver) or speakerphone (loudspeaker)
+async function applyAudioOutputRoute(audioEl) {
+  if (!audioEl) return;
+
+  if ('setSinkId' in HTMLMediaElement.prototype) {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const audioOutputs = devices.filter(d => d.kind === 'audiooutput');
+      if (audioOutputs.length > 0) {
+        let targetId = '';
+        if (isSpeakerMode) {
+          const spk = audioOutputs.find(d => 
+            d.label.toLowerCase().includes('speaker') || 
+            d.label.toLowerCase().includes('loudspeaker') ||
+            d.deviceId === 'speaker'
+          );
+          targetId = spk ? spk.deviceId : 'default';
+          audioEl.volume = 1.0;
+        } else {
+          const ear = audioOutputs.find(d => 
+            d.label.toLowerCase().includes('earpiece') || 
+            d.label.toLowerCase().includes('receiver') || 
+            d.label.toLowerCase().includes('phone') || 
+            d.label.toLowerCase().includes('handset') ||
+            d.deviceId === 'earpiece'
+          );
+          if (ear) {
+            targetId = ear.deviceId;
+            audioEl.volume = 1.0;
+          } else {
+            targetId = 'default';
+            audioEl.volume = 0.35; // Comfortable near-ear volume fallback
+          }
+        }
+
+        if (targetId && audioEl.sinkId !== targetId) {
+          await audioEl.setSinkId(targetId);
+        }
+        return;
+      }
+    } catch (err) {
+      console.warn('setSinkId error:', err);
+    }
+  }
+
+  // Volume-based ear vs speaker routing fallback (audible in both modes)
+  audioEl.volume = isSpeakerMode ? 1.0 : 0.35;
+}
+
+function updateAllAudioOutputs() {
+  const audios = document.querySelectorAll('audio[id^="remote-audio-"]');
+  audios.forEach(a => applyAudioOutputRoute(a));
+  updateSpeakerButtonUI();
+}
+
+function updateSpeakerButtonUI() {
+  if (!speakerBtn) return;
+  const icon = isSpeakerMode
+    ? `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 010 14.14M15.54 8.46a5 5 0 010 7.07"/></svg>`
+    : `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>`;
+
+  speakerBtn.innerHTML = `${icon}<span>${isSpeakerMode ? 'Speaker' : 'Earpiece'}</span>`;
+  speakerBtn.classList.toggle('speaker-active', isSpeakerMode);
+  speakerBtn.classList.remove('muted');
+  speakerBtn.title = isSpeakerMode ? 'Speakerphone (Loud) — Tap for Earpiece' : 'Earpiece (Normal call) — Tap for Speaker';
+}
+
 function createRemoteAudioElement(username) {
   let existing = document.getElementById('remote-audio-' + username);
   if (!existing) {
@@ -1794,8 +1876,7 @@ function createRemoteAudioElement(username) {
     existing.id = 'remote-audio-' + username;
     existing.autoplay = true;
     existing.playsInline = true;
-    // Use volume instead of muted for speaker control (more reliable across browsers)
-    existing.volume = isSpeakerOn ? 1.0 : 0.0;
+    applyAudioOutputRoute(existing);
     if (remoteAudiosContainer) {
       remoteAudiosContainer.appendChild(existing);
     } else {
@@ -1895,21 +1976,37 @@ async function initiatePeerConnection(remoteUser) {
 
   console.log('Initiating call to:', remoteUser);
 
+  const pairKey = getPairKey(currentUser, remoteUser);
+  // Clear any stale signals from past calls before handshake
+  try {
+    await db.ref(`calls/${currentRoom}/signals/${pairKey}`).remove();
+  } catch (_) {}
+
   const pc = new RTCPeerConnection(ICE_SERVERS);
   const audioEl = createRemoteAudioElement(remoteUser);
   peers[remoteUser] = { pc, audioEl, candidateQueue: [], answered: false };
 
-  localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+  // Explicitly add tracks and ensure sendrecv direction for mobile
+  localStream.getTracks().forEach(track => {
+    track.enabled = true;
+    const sender = pc.addTrack(track, localStream);
+    const trans = pc.getTransceivers ? pc.getTransceivers().find(t => t.sender === sender) : null;
+    if (trans) {
+      trans.direction = 'sendrecv';
+    }
+  });
 
   pc.ontrack = (event) => {
-    console.log('Got remote track from', remoteUser);
-    stopRingtoneSound(); // Stop ringtone as soon as we get remote audio
-    audioEl.srcObject = event.streams[0];
-    audioEl.volume = isSpeakerOn ? 1.0 : 0.0;
-    audioEl.play().catch(e => console.warn('Audio play error:', e));
+    console.log('Got remote track from', remoteUser, event.track.kind);
+    stopRingtoneSound();
+    const stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
+    audioEl.srcObject = stream;
+    applyAudioOutputRoute(audioEl);
+    audioEl.play().catch(e => {
+      console.warn('Audio play error, retrying:', e);
+      setTimeout(() => audioEl.play().catch(() => {}), 300);
+    });
   };
-
-  const pairKey = getPairKey(currentUser, remoteUser);
 
   pc.onicecandidate = (event) => {
     if (event.candidate && currentRoom) {
@@ -1920,7 +2017,7 @@ async function initiatePeerConnection(remoteUser) {
   pc.onconnectionstatechange = () => {
     console.log('Connection state with', remoteUser, ':', pc.connectionState);
     if (pc.connectionState === 'connected') {
-      stopRingtoneSound(); // Ensure ringtone stops when connection is established
+      stopRingtoneSound();
     }
     if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
       closePeerConnection(remoteUser);
@@ -2001,14 +2098,25 @@ function listenForIncomingOffers() {
         peerObj = { pc, audioEl, candidateQueue: [], answered: false };
         peers[remoteUser] = peerObj;
 
-        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+        localStream.getTracks().forEach(track => {
+          track.enabled = true;
+          const sender = pc.addTrack(track, localStream);
+          const trans = pc.getTransceivers ? pc.getTransceivers().find(t => t.sender === sender) : null;
+          if (trans) {
+            trans.direction = 'sendrecv';
+          }
+        });
 
         pc.ontrack = (event) => {
-          console.log('Got remote track from', remoteUser);
-          stopRingtoneSound(); // Stop ringtone as soon as we get remote audio
-          audioEl.srcObject = event.streams[0];
-          audioEl.volume = isSpeakerOn ? 1.0 : 0.0;
-          audioEl.play().catch(e => console.warn('Audio play error:', e));
+          console.log('Got remote track from', remoteUser, event.track.kind);
+          stopRingtoneSound();
+          const stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
+          audioEl.srcObject = stream;
+          applyAudioOutputRoute(audioEl);
+          audioEl.play().catch(e => {
+            console.warn('Audio play error, retrying:', e);
+            setTimeout(() => audioEl.play().catch(() => {}), 300);
+          });
         };
 
         pc.onicecandidate = (event) => {
@@ -2020,7 +2128,7 @@ function listenForIncomingOffers() {
         pc.onconnectionstatechange = () => {
           console.log('Connection state with', remoteUser, ':', pc.connectionState);
           if (pc.connectionState === 'connected') {
-            stopRingtoneSound(); // Ensure ringtone stops when connection is established
+            stopRingtoneSound();
           }
           if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
             closePeerConnection(remoteUser);
@@ -2163,14 +2271,21 @@ async function joinGroupCall() {
   callTimerEl.textContent = '00:00';
 
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      },
-      video: false
-    });
+    // Robust mobile audio constraints for telephony
+    const audioConstraints = {
+      echoCancellation: { ideal: true },
+      noiseSuppression: { ideal: true },
+      autoGainControl: { ideal: true },
+      channelCount: { ideal: 1 },
+      sampleRate: { ideal: 48000 }
+    };
+
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints, video: false });
+    } catch (constraintErr) {
+      console.warn('Advanced audio constraints failed, using audio: true', constraintErr);
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    }
 
     // Verify we actually got an audio track
     const audioTracks = localStream.getAudioTracks();
@@ -2179,10 +2294,18 @@ async function joinGroupCall() {
       throw new Error('No audio tracks received from getUserMedia');
     }
 
-    // Ensure mic track is enabled (not muted) when joining
+    // Ensure mic track is enabled (not muted) when joining and monitor mute events
     audioTracks.forEach(track => {
       track.enabled = true;
-      console.log('Audio track enabled:', track.label, 'readyState:', track.readyState);
+      track.onmute = () => {
+        console.warn('Mic track muted by system/hardware, re-enabling:', track.label);
+        track.enabled = true;
+      };
+      track.onunmute = () => {
+        console.log('Mic track unmuted:', track.label);
+        track.enabled = true;
+      };
+      console.log('Audio track active:', track.label, 'readyState:', track.readyState);
     });
     isMicMuted = false;
     isInCall = true;
@@ -2198,6 +2321,7 @@ async function joinGroupCall() {
     // Reset mute button UI
     muteBtn.classList.remove('muted');
     muteBtn.querySelector('span').textContent = 'Mute';
+    updateSpeakerButtonUI();
 
     // Register self as participant — onDisconnect auto-removes
     const myRef = db.ref(`calls/${currentRoom}/participants/${currentUser}`);
@@ -2351,24 +2475,10 @@ muteBtn.addEventListener('click', () => {
 });
 
 speakerBtn.addEventListener('click', () => {
-  isSpeakerOn = !isSpeakerOn;
-  const newVolume = isSpeakerOn ? 1.0 : 0.0;
-
-  // Only change volume on REMOTE audio elements — never touch local mic stream
-  if (remoteAudiosContainer) {
-    remoteAudiosContainer.querySelectorAll('audio').forEach(a => {
-      a.volume = newVolume;
-    });
-  }
-  // Also update any <audio> elements created directly on body
-  document.querySelectorAll('audio[id^="remote-audio-"]').forEach(a => {
-    a.volume = newVolume;
-  });
-
-  speakerBtn.classList.toggle('muted', !isSpeakerOn);
-  speakerBtn.querySelector('span').textContent = isSpeakerOn ? 'Speaker' : 'Spkr Off';
-  showToast(isSpeakerOn ? '🔊 Speaker on' : '🔇 Speaker off');
-  console.log('Speaker toggled:', isSpeakerOn ? 'ON' : 'OFF', '- local mic unaffected');
+  isSpeakerMode = !isSpeakerMode;
+  updateAllAudioOutputs();
+  showToast(isSpeakerMode ? '🔊 Speakerphone (Loudspeaker on)' : '👂 Earpiece mode (Hold phone to ear)');
+  console.log('Audio output toggled. Speaker mode:', isSpeakerMode);
 });
 
 // ============================================

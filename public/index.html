@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content" />
+  <meta name="description" content="A real-time chat app with image sharing, emoji support, and voice calls" />
+  <title>Chatttt — Real-time Chat</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>">
+  <link rel="stylesheet" href="/style.css?v=9">
+</head>
+<body>
+  <!-- LOGIN SCREEN -->
+  <div id="login-screen" class="screen active">
+    <div class="login-container">
+      <div class="login-logo">
+        <div class="logo-icon">💬</div>
+        <h1>Chatttt</h1>
+        <p class="login-subtitle">Connect. Chat. Call.</p>
+      </div>
+      <div class="login-form">
+        <div class="input-group">
+          <label for="username-input">Your Name</label>
+          <input type="text" id="username-input" placeholder="Enter your name..." maxlength="20" autocomplete="off" />
+        </div>
+        <div class="input-group">
+          <label for="room-input">Room Code</label>
+          <input type="text" id="room-input" placeholder="Enter room code..." maxlength="20" autocomplete="off" />
+        </div>
+        <button id="join-btn" class="btn-primary" disabled>
+          <span>Join Room</span>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+        </button>
+      </div>
+      <p class="login-hint">Share the room code with friends to start chatting!</p>
+    </div>
+    <div class="login-bg-orbs">
+      <div class="orb orb-1"></div>
+      <div class="orb orb-2"></div>
+      <div class="orb orb-3"></div>
+    </div>
+  </div>
+
+  <!-- CHAT SCREEN -->
+  <div id="chat-screen" class="screen">
+    <!-- Header -->
+    <header id="chat-header">
+      <div class="header-left">
+        <button id="leave-btn" class="icon-btn" title="Leave Room">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+        </button>
+        <div class="header-info">
+          <h2 id="room-name">Room</h2>
+          <span id="online-count" class="online-badge">0 online</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <button id="sound-toggle-btn" class="icon-btn" title="Toggle Chat Sounds">
+          <svg id="sound-on-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+          <svg id="sound-off-icon" class="hidden" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
+        </button>
+        <button id="share-room-btn" class="icon-btn" title="Share Room Link">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v8a2 2 0 002 2h12a2 2 0 002-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+        </button>
+        <button id="voice-call-btn" class="icon-btn call-btn" title="Voice Call">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Active Room Call Banner -->
+    <div id="active-call-bar" class="active-call-bar hidden">
+      <div class="call-bar-left">
+        <span class="call-pulse-dot"></span>
+        <div class="call-bar-text">
+          <strong id="call-bar-title">Voice Call Active</strong>
+          <span id="call-bar-participants">0 in call</span>
+        </div>
+      </div>
+      <button id="join-call-banner-btn" class="btn-join-call">Join Call</button>
+    </div>
+
+    <!-- Messages -->
+    <div id="messages-container">
+      <div id="messages-list"></div>
+      <div id="typing-indicator" class="hidden">
+        <div class="typing-dots">
+          <span></span><span></span><span></span>
+        </div>
+        <span id="typing-user"></span> is typing...
+      </div>
+      <!-- Floating Scroll to Bottom Button -->
+      <button id="scroll-bottom-btn" class="scroll-bottom-btn hidden" title="Scroll to bottom">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
+        <span id="unread-badge" class="unread-badge hidden">0</span>
+      </button>
+    </div>
+
+    <!-- Input Area (WhatsApp Composer) -->
+    <div id="input-area">
+      <!-- WhatsApp Reply Bar -->
+      <div id="reply-bar" class="reply-bar hidden">
+        <div class="reply-bar-accent"></div>
+        <div class="reply-bar-content">
+          <span id="reply-sender" class="reply-bar-sender">Sender</span>
+          <span id="reply-text" class="reply-bar-text">Replying to message</span>
+        </div>
+        <button id="cancel-reply-btn" class="reply-close-btn" title="Cancel Reply">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+
+      <!-- Docked Media Preview Bar -->
+      <div id="image-preview" class="media-preview-bar hidden">
+        <div class="media-preview-thumb-wrap">
+          <img id="preview-img" src="" alt="Preview" class="hidden" />
+          <video id="preview-video" src="" controls playsinline class="hidden"></video>
+          <button id="cancel-image" class="media-cancel-btn" title="Remove Media">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="media-preview-info">
+          <span id="preview-filename" class="preview-filename">image.jpg</span>
+          <span id="preview-filesize" class="preview-filesize">Ready to send</span>
+        </div>
+        <div id="upload-progress" class="upload-progress-wrap hidden">
+          <div class="progress-track"><div id="upload-bar"></div></div>
+          <span id="upload-status-text" class="upload-status-text">Uploading 0%</span>
+        </div>
+      </div>
+
+      <!-- WhatsApp Voice Record Bar -->
+      <div id="voice-record-bar" class="voice-record-bar hidden">
+        <div class="record-info">
+          <span class="record-pulse-dot"></span>
+          <span id="voice-record-timer" class="record-timer">0:00</span>
+        </div>
+        <div class="record-waveform">
+          <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+          <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+          <span class="wave-bar"></span><span class="wave-bar"></span>
+        </div>
+        <div class="record-actions">
+          <button id="cancel-voice-record" class="icon-btn record-btn-cancel" title="Discard Voice Note">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+          </button>
+          <button id="send-voice-record" class="record-btn-send" title="Send Voice Note">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Emoji Picker -->
+      <div id="emoji-picker" class="hidden">
+        <div id="emoji-grid"></div>
+      </div>
+
+      <!-- Main Input Row -->
+      <div class="input-row" id="main-input-row">
+        <button id="emoji-btn" class="icon-btn" title="Emoji">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
+        </button>
+        <label id="image-upload-label" class="icon-btn" title="Upload Photo or Video">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+          <input type="file" id="image-input" accept="image/*,video/*" hidden />
+        </label>
+        <div class="message-input-wrapper">
+          <input type="text" id="message-input" placeholder="Type a message..." autocomplete="off" />
+        </div>
+        <!-- WhatsApp dynamic buttons: Voice Record (Mic) when empty, Send when has text/media -->
+        <button id="voice-record-btn" class="icon-btn voice-note-btn" title="Record Voice Note">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+        </button>
+        <button id="send-btn" class="icon-btn send-btn hidden" title="Send">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- GROUP VOICE CALL MODAL -->
+  <div id="call-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content call-modal-content">
+      <div class="call-modal-header">
+        <div class="call-header-info">
+          <span class="call-pulse-dot"></span>
+          <span class="call-badge">Live Call</span>
+        </div>
+        <button id="minimize-call-btn" class="icon-btn" title="Minimize & Chat">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
+      </div>
+
+      <div class="call-status">
+        <h3 id="call-status-text">Group Call</h3>
+        <p id="call-timer">00:00</p>
+      </div>
+
+      <!-- Participants Cards -->
+      <div id="call-participants-grid" class="call-participants-grid"></div>
+
+      <div class="call-controls">
+        <button id="mute-btn" class="call-control-btn" title="Mute">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+          <span>Mute</span>
+        </button>
+        <button id="end-call-btn" class="call-control-btn end-call" title="Leave Call">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>
+          <span>Leave</span>
+        </button>
+        <button id="speaker-btn" class="call-control-btn" title="Earpiece (Normal call) — Tap for Speaker">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>
+          <span>Earpiece</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- INCOMING CALL MODAL -->
+  <div id="incoming-call-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content call-modal-content">
+      <div class="call-status">
+        <div class="call-avatar ringing">📞</div>
+        <h3 id="incoming-caller-name">Someone</h3>
+        <p id="incoming-call-desc">started a room voice call!</p>
+        <span class="incoming-sub">Anyone in this room can join</span>
+      </div>
+      <div class="call-controls">
+        <button id="decline-call-btn" class="call-control-btn end-call" title="Dismiss">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <span>Dismiss</span>
+        </button>
+        <button id="accept-call-btn" class="call-control-btn accept-call" title="Join Call">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>
+          <span>Join Call</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- IMAGE LIGHTBOX -->
+  <div id="lightbox" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="lightbox-content">
+      <img id="lightbox-img" src="" alt="Full Image" />
+      <div class="lightbox-actions">
+        <button id="lightbox-download" class="icon-btn" title="Download Image">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        </button>
+        <button id="lightbox-delete" class="icon-btn" title="Delete Image" style="color: #ef4444;">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+        </button>
+        <button id="lightbox-close" class="icon-btn" title="Close">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- DELETE CONFIRMATION MODAL -->
+  <div id="delete-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content delete-modal-content">
+      <div class="delete-modal-icon">🗑️</div>
+      <h3 id="delete-modal-title">Delete Message?</h3>
+      <p id="delete-modal-desc">Are you sure you want to delete this message?</p>
+      <div class="delete-modal-actions">
+        <button id="delete-for-everyone-btn" class="btn-danger-outline">Delete for Everyone</button>
+        <button id="delete-for-me-btn" class="btn-secondary">Delete for Me</button>
+        <button id="delete-cancel-btn" class="btn-ghost">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Remote Audios for Group WebRTC Calls -->
+  <div id="remote-audios-container" style="position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:0.01;pointer-events:none;"></div>
+
+  <!-- Firebase SDK via CDN -->
+  <script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-database-compat.js"></script>
+
+  <script src="/app.js?v=10"></script>
+</body>
+</html>
