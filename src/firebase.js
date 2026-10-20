@@ -1,6 +1,6 @@
 // Firebase configuration and initialization
 import { initializeApp } from 'firebase/app';
-import { getDatabase, ref, push, onValue, set, onDisconnect, serverTimestamp, off, remove, onChildAdded } from 'firebase/database';
+import { getDatabase, ref, push, onValue, set, onDisconnect, serverTimestamp, off, remove, onChildAdded, update } from 'firebase/database';
 
 const firebaseConfig = {
   apiKey: "AIzaSyCNzu5b_YeEZgOqSXx9qeJqSOUFAsJ3tsk",
@@ -16,4 +16,4 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db = getDatabase(app);
 
-export { db, ref, push, onValue, set, onDisconnect, serverTimestamp, off, remove, onChildAdded };
+export { db, ref, push, onValue, set, onDisconnect, serverTimestamp, off, remove, onChildAdded, update };

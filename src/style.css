@@ -202,6 +202,26 @@ button {
   background: rgba(108, 99, 255, 0.05);
 }
 
+/* Disable native Microsoft Edge / IE password reveal and clear eye buttons */
+::-ms-reveal,
+::-ms-clear,
+input::-ms-reveal,
+input::-ms-clear,
+input[type="password"]::-ms-reveal,
+input[type="password"]::-ms-clear,
+#room-input::-ms-reveal,
+#room-input::-ms-clear {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  pointer-events: none !important;
+  visibility: hidden !important;
+}
+
+#room-input {
+  -webkit-text-security: disc !important;
+}
+
 .btn-primary {
   width: 100%;
   padding: 14px 24px;

@@ -9,7 +9,27 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>">
-  <link rel="stylesheet" href="/style.css?v=9">
+  <link rel="stylesheet" href="/style.css?v=12">
+  <style>
+    /* Instant override: Disable Microsoft Edge built-in password reveal icon */
+    ::-ms-reveal,
+    ::-ms-clear,
+    input::-ms-reveal,
+    input::-ms-clear,
+    input[type="password"]::-ms-reveal,
+    input[type="password"]::-ms-clear,
+    #room-input::-ms-reveal,
+    #room-input::-ms-clear {
+      display: none !important;
+      width: 0 !important;
+      height: 0 !important;
+      pointer-events: none !important;
+      visibility: hidden !important;
+    }
+    #room-input {
+      -webkit-text-security: disc !important;
+    }
+  </style>
 </head>
 <body>
   <!-- LOGIN SCREEN -->
@@ -27,7 +47,7 @@
         </div>
         <div class="input-group">
           <label for="room-input">Room Code</label>
-          <input type="text" id="room-input" placeholder="Enter room code..." maxlength="20" autocomplete="off" />
+          <input type="password" id="room-input" placeholder="Enter room code..." maxlength="20" autocomplete="new-password" style="-webkit-text-security: disc !important;" />
         </div>
         <button id="join-btn" class="btn-primary" disabled>
           <span>Join Room</span>
@@ -283,6 +303,6 @@
   <script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-database-compat.js"></script>
 
-  <script src="/app.js?v=10"></script>
+  <script src="/app.js?v=12"></script>
 </body>
 </html>

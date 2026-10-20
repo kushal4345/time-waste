@@ -70,6 +70,17 @@ let recordingTimerInterval = null;
 let recordingStartTime = 0;
 let activeAudio = null;
 let onlineUsersCount = 0;
+let userEntryTimestamp = null;
+let userHasLeft = false;
+
+function formatTime12h(ts) {
+  const d = new Date(ts || Date.now());
+  return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
+}
+
+function sanitizeDbKey(key) {
+  return String(key || '').replace(/[.#$[\]/]/g, '_');
+}
 
 const ICE_SERVERS = {
   iceServers: [
@@ -188,6 +199,22 @@ roomInput.addEventListener('input', validateInputs);
 roomInput.addEventListener('change', validateInputs);
 roomInput.addEventListener('keyup', validateInputs);
 
+function resetLoginCredentials() {
+  if (usernameInput) usernameInput.value = '';
+  if (roomInput) {
+    roomInput.value = '';
+    roomInput.type = 'password';
+  }
+  if (joinBtn) joinBtn.disabled = true;
+  try {
+    if (window.location.hash) {
+      history.replaceState(null, '', window.location.pathname + window.location.search);
+    }
+  } catch (_) {
+    window.location.hash = '';
+  }
+}
+
 usernameInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
     if (roomInput.value.trim().length >= 1) {
@@ -224,6 +251,37 @@ function joinRoom() {
   chatScreen.classList.add('active');
   roomName.textContent = '# ' + currentRoom;
 
+  userHasLeft = false;
+
+  // Retrieve existing entry timestamp for this room session, or store current time
+  const sessionKey = 'chat_entry_' + currentRoom + '_' + currentUser;
+  const storedEntry = sessionStorage.getItem(sessionKey);
+  if (storedEntry && !isNaN(Number(storedEntry))) {
+    userEntryTimestamp = Number(storedEntry);
+  } else {
+    userEntryTimestamp = Date.now();
+    sessionStorage.setItem(sessionKey, String(userEntryTimestamp));
+  }
+  const entryTimeStr = formatTime12h(userEntryTimestamp);
+
+  // Store user session & entry time in Firebase database
+  const safeUserKey = sanitizeDbKey(currentUser);
+  const sessionRef = db.ref('user_sessions/' + currentRoom + '/' + safeUserKey);
+  sessionRef.set({
+    username: currentUser,
+    room: currentRoom,
+    enteredAt: userEntryTimestamp,
+    enteredTimeStr: entryTimeStr,
+    leftAt: null,
+    leftTimeStr: null,
+    status: 'online',
+    lastActive: firebase.database.ServerValue.TIMESTAMP
+  });
+  sessionRef.onDisconnect().update({
+    leftAt: firebase.database.ServerValue.TIMESTAMP,
+    status: 'offline'
+  });
+
   setupPresence();
   listenForMessages();
   listenForTyping();
@@ -231,19 +289,71 @@ function joinRoom() {
   updateInputButtonState();
 
   setTimeout(() => messageInput.focus(), 300);
-  sendSystemMessage(currentUser + ' joined the room');
+
+  // Mention entry time in chat room message
+  sendSystemMessage(`${currentUser} joined the room • Entered at ${entryTimeStr}`, {
+    action: 'join',
+    user: currentUser,
+    enteredAt: userEntryTimestamp,
+    enteredTimeStr: entryTimeStr
+  });
 }
 
 // ============================================
 // LEAVE ROOM
 // ============================================
+function recordAndSendUserLeave() {
+  if (!currentRoom || !currentUser || userHasLeft) return;
+  userHasLeft = true;
+
+  const leftAt = Date.now();
+  const leftTimeStr = formatTime12h(leftAt);
+  const entryTimeStr = formatTime12h(userEntryTimestamp || leftAt);
+
+  // Mention both left time and entry time in chat room
+  const leaveMsgText = `${currentUser} left the room • Left at ${leftTimeStr} (Entered at ${entryTimeStr})`;
+
+  sendSystemMessage(leaveMsgText, {
+    action: 'leave',
+    user: currentUser,
+    enteredAt: userEntryTimestamp || leftAt,
+    enteredTimeStr: entryTimeStr,
+    leftAt: leftAt,
+    leftTimeStr: leftTimeStr
+  });
+
+  // Store left time in Firebase database
+  const safeUserKey = sanitizeDbKey(currentUser);
+  try {
+    db.ref('user_sessions/' + currentRoom + '/' + safeUserKey).update({
+      leftAt: leftAt,
+      leftTimeStr: leftTimeStr,
+      status: 'offline',
+      lastActive: firebase.database.ServerValue.TIMESTAMP
+    });
+  } catch (_) {}
+
+  try {
+    sessionStorage.removeItem('chat_entry_' + currentRoom + '_' + currentUser);
+  } catch (_) {}
+}
+
 leaveBtn.addEventListener('click', () => {
-  sendSystemMessage(currentUser + ' left the room');
+  recordAndSendUserLeave();
   setTimeout(leaveRoom, 300);
 });
 
+window.addEventListener('beforeunload', () => {
+  if (currentRoom && currentUser && !userHasLeft) {
+    recordAndSendUserLeave();
+  }
+});
+
 function leaveRoom() {
+  const safeUserKey = sanitizeDbKey(currentUser);
+  db.ref('presence/' + currentRoom + '/' + safeUserKey).remove();
   db.ref('presence/' + currentRoom + '/' + currentUser).remove();
+  db.ref('typing/' + currentRoom + '/' + safeUserKey).remove();
   db.ref('typing/' + currentRoom + '/' + currentUser).remove();
   db.ref('messages/' + currentRoom).off();
   db.ref('presence/' + currentRoom).off();
@@ -261,10 +371,62 @@ function leaveRoom() {
   lastMessageDate = '';
   currentUser = '';
   currentRoom = '';
+  userEntryTimestamp = null;
+  userHasLeft = false;
+
+  // Clear URL hash to prevent room leak in browser history & address bar
+  try {
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+  } catch (_) {
+    window.location.hash = '';
+  }
+
+  // Security: Reset both name and room code fields completely
+  resetLoginCredentials();
 
   chatScreen.classList.remove('active');
   loginScreen.classList.add('active');
+  if (usernameInput) usernameInput.focus();
 }
+
+// Background & Inactivity Security Handler: Reset values when opening from background
+let backgroundTimer = null;
+const INACTIVITY_RESET_MS = 5 * 60 * 1000; // 5 minutes
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    backgroundTimer = Date.now();
+  } else {
+    const elapsed = backgroundTimer ? (Date.now() - backgroundTimer) : 0;
+    backgroundTimer = null;
+
+    // If on login screen when returning from background, clear credentials immediately
+    if (!chatScreen.classList.contains('active')) {
+      resetLoginCredentials();
+    } else if (elapsed > INACTIVITY_RESET_MS) {
+      // If away in background for more than 5 minutes while in room, auto-leave & reset for security
+      recordAndSendUserLeave();
+      leaveRoom();
+      showToast('Session ended due to inactivity for security 🔒');
+    }
+  }
+});
+
+// Handle Back/Forward Navigation & browser back button
+window.addEventListener('pageshow', (event) => {
+  if (!chatScreen.classList.contains('active')) {
+    resetLoginCredentials();
+  }
+});
+
+window.addEventListener('popstate', () => {
+  if (chatScreen.classList.contains('active')) {
+    recordAndSendUserLeave();
+    leaveRoom();
+  } else {
+    resetLoginCredentials();
+  }
+});
 
 // ============================================
 // PRESENCE (Online Users)
@@ -342,12 +504,21 @@ if (soundToggleBtn) {
 // PRESENCE (Online Users)
 // ============================================
 function setupPresence() {
-  const presenceRef = db.ref('presence/' + currentRoom + '/' + currentUser);
+  const safeUserKey = sanitizeDbKey(currentUser);
+  const presenceRef = db.ref('presence/' + currentRoom + '/' + safeUserKey);
   const connectedRef = db.ref('.info/connected');
+
+  const entryTimeStr = formatTime12h(userEntryTimestamp || Date.now());
 
   connectedRef.on('value', (snap) => {
     if (snap.val() === true) {
-      presenceRef.set({ online: true, lastSeen: firebase.database.ServerValue.TIMESTAMP });
+      presenceRef.set({
+        online: true,
+        username: currentUser,
+        enteredAt: userEntryTimestamp || Date.now(),
+        enteredTimeStr: entryTimeStr,
+        lastSeen: firebase.database.ServerValue.TIMESTAMP
+      });
       presenceRef.onDisconnect().remove();
     }
   });
@@ -1207,11 +1378,12 @@ async function sendMediaMessage(caption) {
   }
 }
 
-function sendSystemMessage(text) {
+function sendSystemMessage(text, meta = {}) {
   db.ref('messages/' + currentRoom).push({
     type: 'system',
     text: text,
-    timestamp: Date.now()
+    timestamp: Date.now(),
+    ...meta
   });
 }
 
@@ -2544,13 +2716,16 @@ function setupVisualViewport() {
 
 setupVisualViewport();
 
-// Auto-fill room from URL hash (e.g., http://localhost:3000/#myroom)
+// Auto-fill room from URL hash ONLY on first direct invite link click, then clear hash from URL bar
 if (window.location.hash) {
   const hashRoom = window.location.hash.replace(/^#/, '').trim();
   if (hashRoom) {
     roomInput.value = hashRoom;
     validateInputs();
     usernameInput.focus();
+    try {
+      history.replaceState(null, '', window.location.pathname + window.location.search);
+    } catch (_) {}
   }
 }
 
