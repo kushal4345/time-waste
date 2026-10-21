@@ -2241,91 +2241,6 @@ function updateCallBanner(count, participants) {
 }
 
 // ============================================
-// LOW-BANDWIDTH AUDIO OPTIMIZER (PeerUp / WhatsApp style)
-// ============================================
-function optimizeSdpForLowBandwidth(sdp) {
-  if (!sdp) return sdp;
-
-  let lines = sdp.split('\r\n');
-  let opusPt = null;
-
-  for (let line of lines) {
-    const m = line.match(/^a=rtpmap:(\d+)\s+opus\/48000/i);
-    if (m) {
-      opusPt = m[1];
-      break;
-    }
-  }
-
-  // Target 16 kbps HD wideband voice with in-band FEC and DTX
-  // - maxaveragebitrate=16000: uses 75% less bandwidth than default 64kbps, works on 2G/3G
-  // - useinbandfec=1: Forward Error Correction automatically recovers lost packets on weak connections
-  // - usedtx=1: Discontinuous Transmission pauses sending when silent (saves 90% bandwidth)
-  // - stereo=0;sprop-stereo=0: single channel mono
-  // - cbr=0: variable bitrate adapts to network conditions
-  // - maxplaybackrate=16000: 16kHz telephony voice
-  // - ptime=20;maxptime=40: 20ms packet intervals
-  const opusFmtpParams = 'maxaveragebitrate=16000;useinbandfec=1;usedtx=1;stereo=0;sprop-stereo=0;cbr=0;maxplaybackrate=16000;ptime=20;maxptime=40';
-
-  let hasFmtp = false;
-  let newLines = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    let line = lines[i];
-
-    if (line.startsWith('m=audio ')) {
-      newLines.push(line);
-      newLines.push('b=AS:24');
-      newLines.push('b=TIAS:24000');
-      continue;
-    }
-
-    if (line.startsWith('b=AS:') || line.startsWith('b=TIAS:')) {
-      continue;
-    }
-
-    if (opusPt && line.startsWith(`a=fmtp:${opusPt} `)) {
-      hasFmtp = true;
-      newLines.push(`a=fmtp:${opusPt} ${opusFmtpParams}`);
-      continue;
-    }
-
-    newLines.push(line);
-  }
-
-  if (opusPt && !hasFmtp) {
-    let finalLines = [];
-    for (let line of newLines) {
-      finalLines.push(line);
-      if (line.startsWith(`a=rtpmap:${opusPt} `)) {
-        finalLines.push(`a=fmtp:${opusPt} ${opusFmtpParams}`);
-      }
-    }
-    return finalLines.join('\r\n');
-  }
-
-  return newLines.join('\r\n');
-}
-
-function applyLowBandwidthSenderParameters(sender) {
-  if (!sender || !sender.getParameters || !sender.setParameters) return;
-  try {
-    const params = sender.getParameters();
-    if (params && params.encodings && params.encodings.length > 0) {
-      params.encodings.forEach(enc => {
-        enc.maxBitrate = 16000; // 16 kbps max
-        enc.networkPriority = 'high';
-        enc.priority = 'high';
-      });
-      if ('voiceActivityDetection' in params) {
-        params.voiceActivityDetection = true;
-      }
-      sender.setParameters(params).catch(() => {});
-    }
-  } catch (_) {}
-}
-
-// ============================================
 // WEBRTC PEER CONNECTIONS
 // ============================================
 async function initiatePeerConnection(remoteUser) {
@@ -2352,11 +2267,10 @@ async function initiatePeerConnection(remoteUser) {
   const peerObj = { pc, audioEl, candidateQueue: [], answered: false };
   peers[remoteUser] = peerObj;
 
-  // Add audio track with low-bandwidth parameters
+  // Add local audio tracks
   localStream.getAudioTracks().forEach(track => {
     track.enabled = !isMicMuted;
-    const sender = pc.addTrack(track, localStream);
-    applyLowBandwidthSenderParameters(sender);
+    pc.addTrack(track, localStream);
   });
 
   pc.ontrack = (event) => {
@@ -2365,10 +2279,11 @@ async function initiatePeerConnection(remoteUser) {
     const stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
     audioEl.srcObject = stream;
     audioEl.muted = false;
+    audioEl.volume = 1.0;
     applyAudioOutputRoute(audioEl);
     audioEl.play().catch(e => {
       console.warn('Audio play error, retrying:', e);
-      setTimeout(() => audioEl.play().catch(() => {}), 300);
+      setTimeout(() => { audioEl.muted = false; audioEl.volume = 1.0; audioEl.play().catch(() => {}); }, 500);
     });
     callStatusText.textContent = 'Live Voice Call';
   };
@@ -2404,19 +2319,18 @@ async function initiatePeerConnection(remoteUser) {
       offerToReceiveAudio: true,
       voiceActivityDetection: true
     });
-    const lowBwSdp = optimizeSdpForLowBandwidth(offer.sdp);
-    await pc.setLocalDescription(new RTCSessionDescription({ type: offer.type, sdp: lowBwSdp }));
+    await pc.setLocalDescription(offer);
 
     const offerData = {
       from: currentUser,
       to: remoteUser,
       type: offer.type,
-      sdp: lowBwSdp,
+      sdp: offer.sdp,
       ts: Date.now()
     };
 
     await db.ref(`calls/${currentRoom}/signals/${pairKey}/offer`).set(offerData);
-    console.log('Offer sent to', remoteUser, '(Low Bandwidth Mode)');
+    console.log('Offer sent to', remoteUser);
 
     // Listen for answer
     db.ref(`calls/${currentRoom}/signals/${pairKey}/answer`).on('value', async (snap) => {
@@ -2428,10 +2342,9 @@ async function initiatePeerConnection(remoteUser) {
 
       try {
         peers[remoteUser].answered = true;
-        const lowBwAnswerSdp = optimizeSdpForLowBandwidth(answer.sdp);
-        await pc.setRemoteDescription(new RTCSessionDescription({ type: answer.type, sdp: lowBwAnswerSdp }));
+        await pc.setRemoteDescription(new RTCSessionDescription({ type: answer.type, sdp: answer.sdp }));
         await flushCandidates(remoteUser);
-        console.log('Answer received from', remoteUser, '— connected (Low Bandwidth Mode)!');
+        console.log('Answer received from', remoteUser, '— connected!');
         callStatusText.textContent = 'Live Voice Call';
       } catch (e) {
         console.error('Error setting answer from', remoteUser, e);
@@ -2486,8 +2399,7 @@ function listenForIncomingOffers() {
 
       localStream.getAudioTracks().forEach(track => {
         track.enabled = !isMicMuted;
-        const sender = pc.addTrack(track, localStream);
-        applyLowBandwidthSenderParameters(sender);
+        pc.addTrack(track, localStream);
       });
 
       pc.ontrack = (event) => {
@@ -2496,10 +2408,11 @@ function listenForIncomingOffers() {
         const stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
         audioEl.srcObject = stream;
         audioEl.muted = false;
+        audioEl.volume = 1.0;
         applyAudioOutputRoute(audioEl);
         audioEl.play().catch(e => {
           console.warn('Audio play error, retrying:', e);
-          setTimeout(() => audioEl.play().catch(() => {}), 300);
+          setTimeout(() => { audioEl.muted = false; audioEl.volume = 1.0; audioEl.play().catch(() => {}); }, 500);
         });
         callStatusText.textContent = 'Live Voice Call';
       };
@@ -2524,26 +2437,22 @@ function listenForIncomingOffers() {
       });
 
       try {
-        const lowBwOfferSdp = optimizeSdpForLowBandwidth(offer.sdp);
-        await pc.setRemoteDescription(new RTCSessionDescription({ type: offer.type, sdp: lowBwOfferSdp }));
+        await pc.setRemoteDescription(new RTCSessionDescription({ type: offer.type, sdp: offer.sdp }));
         await flushCandidates(remoteUser);
 
-        const answer = await pc.createAnswer({
-          offerToReceiveAudio: true
-        });
-        const lowBwAnswerSdp = optimizeSdpForLowBandwidth(answer.sdp);
-        await pc.setLocalDescription(new RTCSessionDescription({ type: answer.type, sdp: lowBwAnswerSdp }));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
 
         await db.ref(`calls/${currentRoom}/signals/${pairKey}/answer`).set({
           from: currentUser,
           to: remoteUser,
           type: answer.type,
-          sdp: lowBwAnswerSdp,
+          sdp: answer.sdp,
           ts: Date.now()
         });
 
         peerObj.answered = true;
-        console.log('Answer sent to', remoteUser, '(Low Bandwidth Mode)');
+        console.log('Answer sent to', remoteUser);
       } catch (err) {
         console.error('Error answering offer from', remoteUser, err);
       }
