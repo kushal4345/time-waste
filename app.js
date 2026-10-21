@@ -92,12 +92,22 @@ const ICE_SERVERS = {
     { urls: 'stun:global.stun.twilio.com:3478' },
     {
       urls: [
-        'turn:openrelay.metered.ca:80',
-        'turn:openrelay.metered.ca:443',
-        'turn:openrelay.metered.ca:443?transport=tcp'
+        'turn:global.openrelay.metered.ca:80',
+        'turn:global.openrelay.metered.ca:443',
+        'turn:global.openrelay.metered.ca:443?transport=tcp'
       ],
       username: 'openrelayproject',
       credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:relay.metered.ca:80',
+      username: 'e8dd65b92f6aee9de7b55c03',
+      credential: '2VfGpfqaSw8Rl6ZY'
+    },
+    {
+      urls: 'turn:relay.metered.ca:443?transport=tcp',
+      username: 'e8dd65b92f6aee9de7b55c03',
+      credential: '2VfGpfqaSw8Rl6ZY'
     }
   ],
   iceCandidatePoolSize: 10
@@ -2243,48 +2253,42 @@ function updateCallBanner(count, participants) {
 // ============================================
 // WEBRTC PEER CONNECTIONS
 // ============================================
-async function initiatePeerConnection(remoteUser) {
-  if (!isInCall || !localStream) return;
-  if (remoteUser === currentUser) return;
+function setupAudioElement(audioEl, remoteUser, stream) {
+  audioEl.srcObject = stream;
+  audioEl.muted = false;
+  audioEl.volume = 1.0;
+  audioEl.autoplay = true;
+  audioEl.setAttribute('autoplay', 'true');
+  audioEl.setAttribute('playsinline', 'true');
 
-  const pairKey = getPairKey(currentUser, remoteUser);
-  console.log('Initiating peer connection to:', remoteUser, 'pairKey:', pairKey);
-
-  // Close previous connection if exists
-  if (peers[remoteUser]) {
-    try { peers[remoteUser].pc.close(); } catch (e) {}
-    removeRemoteAudioElement(remoteUser);
-    delete peers[remoteUser];
-  }
-
-  // Clear stale signals for this pair before initiating
-  try {
-    await db.ref(`calls/${currentRoom}/signals/${pairKey}`).remove();
-  } catch (_) {}
-
-  const pc = new RTCPeerConnection(ICE_SERVERS);
-  const audioEl = createRemoteAudioElement(remoteUser);
-  const peerObj = { pc, audioEl, candidateQueue: [], answered: false };
-  peers[remoteUser] = peerObj;
-
-  // Add local audio tracks
-  localStream.getAudioTracks().forEach(track => {
-    track.enabled = !isMicMuted;
-    pc.addTrack(track, localStream);
-  });
-
-  pc.ontrack = (event) => {
-    console.log('Got remote audio track from', remoteUser, event.track.kind);
-    stopRingtoneSound();
-    const stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
-    audioEl.srcObject = stream;
+  // Force unmute and play (mobile workaround)
+  const tryPlay = () => {
+    if (!audioEl.srcObject) return;
     audioEl.muted = false;
     audioEl.volume = 1.0;
     applyAudioOutputRoute(audioEl);
-    audioEl.play().catch(e => {
-      console.warn('Audio play error, retrying:', e);
-      setTimeout(() => { audioEl.muted = false; audioEl.volume = 1.0; audioEl.play().catch(() => {}); }, 500);
+    audioEl.play().then(() => {
+      console.log('Audio playing for', remoteUser);
+    }).catch(e => {
+      console.warn('Audio play failed for', remoteUser, e);
+      setTimeout(tryPlay, 1000);
     });
+  };
+  tryPlay();
+}
+
+function setupPeerConnectionEvents(pc, remoteUser, audioEl, pairKey) {
+  pc.ontrack = (event) => {
+    console.log('=== GOT REMOTE TRACK from', remoteUser, '===', event.track.kind, 'readyState:', event.track.readyState);
+    stopRingtoneSound();
+    const stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
+
+    // Monitor track state
+    event.track.onended = () => console.warn('Remote track ended from', remoteUser);
+    event.track.onmute = () => console.warn('Remote track muted from', remoteUser);
+    event.track.onunmute = () => console.log('Remote track unmuted from', remoteUser);
+
+    setupAudioElement(audioEl, remoteUser, stream);
     callStatusText.textContent = 'Live Voice Call';
   };
 
@@ -2294,13 +2298,38 @@ async function initiatePeerConnection(remoteUser) {
     }
   };
 
+  pc.oniceconnectionstatechange = () => {
+    console.log('ICE connection state with', remoteUser, ':', pc.iceConnectionState);
+    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      stopRingtoneSound();
+      callStatusText.textContent = 'Live Voice Call';
+    } else if (pc.iceConnectionState === 'failed') {
+      console.warn('ICE connection failed with', remoteUser);
+      if (isInCall && currentCallParticipants[remoteUser] && currentUser > remoteUser) {
+        console.log('Attempting reconnect with', remoteUser);
+        setTimeout(() => {
+          if (isInCall && currentCallParticipants[remoteUser]) {
+            initiatePeerConnection(remoteUser);
+          }
+        }, 2000);
+      }
+    } else if (pc.iceConnectionState === 'disconnected') {
+      setTimeout(() => {
+        if (pc.iceConnectionState === 'disconnected' && isInCall && currentCallParticipants[remoteUser] && currentUser > remoteUser) {
+          console.warn('ICE still disconnected, reconnecting with', remoteUser);
+          initiatePeerConnection(remoteUser);
+        }
+      }, 5000);
+    }
+  };
+
   pc.onconnectionstatechange = () => {
     console.log('Connection state with', remoteUser, ':', pc.connectionState);
     if (pc.connectionState === 'connected') {
       stopRingtoneSound();
       callStatusText.textContent = 'Live Voice Call';
     } else if (pc.connectionState === 'failed') {
-      console.warn('Connection failed with', remoteUser, '— retrying in 2s');
+      console.warn('Connection failed with', remoteUser, '\u2014 retrying in 2s');
       setTimeout(() => {
         if (isInCall && currentCallParticipants[remoteUser] && currentUser > remoteUser) {
           initiatePeerConnection(remoteUser);
@@ -2313,6 +2342,46 @@ async function initiatePeerConnection(remoteUser) {
   db.ref(`calls/${currentRoom}/signals/${pairKey}/ice_${remoteUser}`).on('child_added', (snap) => {
     handleRemoteIceCandidate(remoteUser, snap.val());
   });
+}
+
+async function initiatePeerConnection(remoteUser) {
+  if (!isInCall || !localStream) return;
+  if (remoteUser === currentUser) return;
+
+  const pairKey = getPairKey(currentUser, remoteUser);
+  console.log('=== INITIATING peer connection to:', remoteUser, 'pairKey:', pairKey, '===');
+
+  // Close previous connection if exists
+  if (peers[remoteUser]) {
+    try {
+      db.ref(`calls/${currentRoom}/signals/${pairKey}/ice_${remoteUser}`).off();
+      peers[remoteUser].pc.close();
+    } catch (e) {}
+    removeRemoteAudioElement(remoteUser);
+    delete peers[remoteUser];
+  }
+
+  // Clear stale signals for this pair before initiating
+  try {
+    await db.ref(`calls/${currentRoom}/signals/${pairKey}`).remove();
+  } catch (_) {}
+
+  // Small delay to ensure Firebase remove completes
+  await new Promise(r => setTimeout(r, 200));
+
+  const pc = new RTCPeerConnection(ICE_SERVERS);
+  const audioEl = createRemoteAudioElement(remoteUser);
+  const peerObj = { pc, audioEl, candidateQueue: [], answered: false };
+  peers[remoteUser] = peerObj;
+
+  // Add local audio tracks
+  localStream.getAudioTracks().forEach(track => {
+    track.enabled = !isMicMuted;
+    pc.addTrack(track, localStream);
+    console.log('Added local track:', track.label, 'enabled:', track.enabled);
+  });
+
+  setupPeerConnectionEvents(pc, remoteUser, audioEl, pairKey);
 
   try {
     const offer = await pc.createOffer({
@@ -2325,29 +2394,34 @@ async function initiatePeerConnection(remoteUser) {
       from: currentUser,
       to: remoteUser,
       type: offer.type,
-      sdp: offer.sdp,
+      sdp: pc.localDescription.sdp,
       ts: Date.now()
     };
 
     await db.ref(`calls/${currentRoom}/signals/${pairKey}/offer`).set(offerData);
-    console.log('Offer sent to', remoteUser);
+    console.log('Offer sent to', remoteUser, 'sdp length:', offerData.sdp.length);
 
     // Listen for answer
     db.ref(`calls/${currentRoom}/signals/${pairKey}/answer`).on('value', async (snap) => {
       const answer = snap.val();
       if (!answer || answer.to !== currentUser) return;
       if (!peers[remoteUser] || peers[remoteUser].answered) return;
-      if (pc.signalingState !== 'have-local-offer') return;
-      if (answer.ts && answer.ts < offerData.ts) return; // ignore stale answer
+      if (pc.signalingState !== 'have-local-offer') {
+        console.warn('Ignoring answer \u2014 wrong signaling state:', pc.signalingState);
+        return;
+      }
+      if (answer.ts && answer.ts < offerData.ts) return;
 
       try {
         peers[remoteUser].answered = true;
+        console.log('Setting remote answer from', remoteUser, 'sdp length:', answer.sdp.length);
         await pc.setRemoteDescription(new RTCSessionDescription({ type: answer.type, sdp: answer.sdp }));
         await flushCandidates(remoteUser);
-        console.log('Answer received from', remoteUser, '— connected!');
+        console.log('=== Answer set from', remoteUser, '\u2014 media should flow now ===');
         callStatusText.textContent = 'Live Voice Call';
       } catch (e) {
         console.error('Error setting answer from', remoteUser, e);
+        peers[remoteUser].answered = false;
       }
     });
 
@@ -2356,15 +2430,23 @@ async function initiatePeerConnection(remoteUser) {
   }
 }
 
+// Track active offer listeners to avoid duplicates
+let activeOfferListeners = {};
+
 function listenForIncomingOffers() {
   if (!currentRoom || isListeningForOffers) return;
   isListeningForOffers = true;
+  activeOfferListeners = {};
 
   const handleOfferSignal = async (snap) => {
     const pairKey = snap.key;
     if (!pairKey) return;
     const parts = pairKey.split('___');
     if (!parts.includes(sanitizeDbKey(currentUser))) return;
+
+    // Don't create duplicate listeners for the same pairKey
+    if (activeOfferListeners[pairKey]) return;
+    activeOfferListeners[pairKey] = true;
 
     db.ref(`calls/${currentRoom}/signals/${pairKey}/offer`).on('value', async (offerSnap) => {
       const offer = offerSnap.val();
@@ -2379,15 +2461,21 @@ function listenForIncomingOffers() {
       }
 
       // If already connected with this exact offer, do not re-answer
-      if (peers[remoteUser] && peers[remoteUser].lastOfferTs === offer.ts && peers[remoteUser].pc.connectionState === 'connected') {
-        return;
+      if (peers[remoteUser] && peers[remoteUser].lastOfferTs === offer.ts) {
+        const state = peers[remoteUser].pc.connectionState || peers[remoteUser].pc.iceConnectionState;
+        if (state === 'connected' || state === 'completed') {
+          return;
+        }
       }
 
-      console.log('Incoming offer from', remoteUser, 'ts:', offer.ts);
+      console.log('=== INCOMING offer from', remoteUser, 'ts:', offer.ts, '===');
 
       // Clean up previous peer connection if any
       if (peers[remoteUser]) {
-        try { peers[remoteUser].pc.close(); } catch (e) {}
+        try {
+          db.ref(`calls/${currentRoom}/signals/${pairKey}/ice_${remoteUser}`).off();
+          peers[remoteUser].pc.close();
+        } catch (e) {}
         removeRemoteAudioElement(remoteUser);
         delete peers[remoteUser];
       }
@@ -2400,43 +2488,13 @@ function listenForIncomingOffers() {
       localStream.getAudioTracks().forEach(track => {
         track.enabled = !isMicMuted;
         pc.addTrack(track, localStream);
+        console.log('Added local track for answer:', track.label, 'enabled:', track.enabled);
       });
 
-      pc.ontrack = (event) => {
-        console.log('Got remote audio track from', remoteUser, event.track.kind);
-        stopRingtoneSound();
-        const stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
-        audioEl.srcObject = stream;
-        audioEl.muted = false;
-        audioEl.volume = 1.0;
-        applyAudioOutputRoute(audioEl);
-        audioEl.play().catch(e => {
-          console.warn('Audio play error, retrying:', e);
-          setTimeout(() => { audioEl.muted = false; audioEl.volume = 1.0; audioEl.play().catch(() => {}); }, 500);
-        });
-        callStatusText.textContent = 'Live Voice Call';
-      };
-
-      pc.onicecandidate = (event) => {
-        if (event.candidate && currentRoom) {
-          db.ref(`calls/${currentRoom}/signals/${pairKey}/ice_${currentUser}`).push(event.candidate.toJSON());
-        }
-      };
-
-      pc.onconnectionstatechange = () => {
-        console.log('Connection state with', remoteUser, ':', pc.connectionState);
-        if (pc.connectionState === 'connected') {
-          stopRingtoneSound();
-          callStatusText.textContent = 'Live Voice Call';
-        }
-      };
-
-      // Listen for ICE candidates from initiator
-      db.ref(`calls/${currentRoom}/signals/${pairKey}/ice_${remoteUser}`).on('child_added', (candSnap) => {
-        handleRemoteIceCandidate(remoteUser, candSnap.val());
-      });
+      setupPeerConnectionEvents(pc, remoteUser, audioEl, pairKey);
 
       try {
+        console.log('Setting remote offer from', remoteUser, 'sdp length:', offer.sdp.length);
         await pc.setRemoteDescription(new RTCSessionDescription({ type: offer.type, sdp: offer.sdp }));
         await flushCandidates(remoteUser);
 
@@ -2447,12 +2505,12 @@ function listenForIncomingOffers() {
           from: currentUser,
           to: remoteUser,
           type: answer.type,
-          sdp: answer.sdp,
+          sdp: pc.localDescription.sdp,
           ts: Date.now()
         });
 
         peerObj.answered = true;
-        console.log('Answer sent to', remoteUser);
+        console.log('=== Answer sent to', remoteUser, '\u2014 waiting for media ===');
       } catch (err) {
         console.error('Error answering offer from', remoteUser, err);
       }
@@ -2649,6 +2707,7 @@ function leaveGroupCall(updateDb = true) {
   isInCall = false;
   isJoiningCall = false;
   isListeningForOffers = false;
+  activeOfferListeners = {};
 
   if (currentRoom) {
     try {
