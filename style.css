@@ -1828,6 +1828,26 @@ input::-webkit-contacts-auto-fill-button {
   color: var(--danger);
 }
 
+.participant-card.speaking {
+  border-color: rgba(37, 211, 102, 0.8) !important;
+  box-shadow: 0 0 16px rgba(37, 211, 102, 0.35) !important;
+}
+
+.participant-card.speaking .p-avatar {
+  box-shadow: 0 0 0 3px rgba(37, 211, 102, 0.5), 0 0 16px rgba(37, 211, 102, 0.75);
+  animation: pulse-talking 0.9s infinite alternate ease-in-out;
+}
+
+@keyframes pulse-talking {
+  0% { transform: scale(1); box-shadow: 0 0 0 2px rgba(37, 211, 102, 0.4), 0 0 10px rgba(37, 211, 102, 0.5); }
+  100% { transform: scale(1.08); box-shadow: 0 0 0 5px rgba(37, 211, 102, 0.8), 0 0 22px rgba(37, 211, 102, 0.95); }
+}
+
+.participant-card.speaking .p-tag {
+  color: #25d366 !important;
+  font-weight: 600;
+}
+
 .call-controls {
   display: flex;
   justify-content: center;

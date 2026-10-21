@@ -9,7 +9,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>">
-  <link rel="stylesheet" href="/style.css?v=12">
+  <link rel="stylesheet" href="/style.css?v=13">
   <style>
     /* Instant override: Disable Microsoft Edge built-in password reveal icon */
     ::-ms-reveal,
@@ -297,12 +297,12 @@
   </div>
 
   <!-- Remote Audios for Group WebRTC Calls -->
-  <div id="remote-audios-container" style="position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:0.01;pointer-events:none;"></div>
+  <div id="remote-audios-container" style="position:fixed;bottom:-1000px;left:-1000px;width:100px;height:100px;pointer-events:none;" aria-hidden="true"></div>
 
   <!-- Firebase SDK via CDN -->
   <script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-database-compat.js"></script>
 
-  <script src="/app.js?v=12"></script>
+  <script src="/app.js?v=14"></script>
 </body>
 </html>
