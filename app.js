@@ -89,6 +89,8 @@ const ICE_SERVERS = {
     { urls: 'stun:stun2.l.google.com:19302' },
     { urls: 'stun:stun3.l.google.com:19302' },
     { urls: 'stun:stun4.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:stun.services.mozilla.com' },
     { urls: 'stun:global.stun.twilio.com:3478' },
     {
       urls: [
@@ -1924,14 +1926,16 @@ lightboxClose.addEventListener('click', () => lightbox.classList.add('hidden'));
 lightbox.querySelector('.modal-backdrop').addEventListener('click', () => lightbox.classList.add('hidden'));
 
 // ============================================
-// GROUP VOICE CALL (Mesh WebRTC)
+// GOOGLE MEET-GRADE WEBRTC VOICE ENGINE
 // ============================================
-let peers = {}; // username -> { pc, audioEl, candidateQueue, answered, lastOfferTs }
+
+// State & peer management
+let peers = {}; // username -> { pc, audioEl, candidateQueue, seenCandidates, currentOfferToken, lastProcessedToken, isInitiator, reconnectTimeout }
 let localStream = null;
 let isInCall = false;
-let isJoiningCall = false; // guard against ringtone race during async join
+let isJoiningCall = false;
 let isMicMuted = false;
-let isSpeakerMode = true; // default to loud Speakerphone so users hear immediately
+let isSpeakerMode = true; // Default to loudspeaker
 let callStartTime = null;
 let callTimerInterval = null;
 let currentCallParticipants = {};
@@ -1939,34 +1943,189 @@ let hasDismissedCallModal = false;
 let ringtoneAudioCtx = null;
 let ringtoneInterval = null;
 let isListeningForOffers = false;
-
-// Audio level / speaking detection
-let micAudioContext = null;
-let micAnalyser = null;
-let micDataArray = null;
-let micCheckInterval = null;
 let speakingUsers = {};
 
-function unlockAudioPlayback() {
-  try {
-    const AudioCtx = window.AudioContext || window.webkitAudioContext;
-    if (AudioCtx) {
-      const ctx = new AudioCtx();
-      if (ctx.state === 'suspended') {
-        ctx.resume().catch(() => {});
+// Helper: Pair key for deterministic Firebase signaling paths
+function getPairKey(user1, user2) {
+  return [sanitizeDbKey(user1), sanitizeDbKey(user2)].sort().join('___');
+}
+
+// ============================================
+// PERSISTENT WEB AUDIO & VOICE ACTIVITY ENGINE
+// ============================================
+class CallAudioEngine {
+  constructor() {
+    this.ctx = null;
+    this.localAnalyser = null;
+    this.remoteChannels = new Map(); // username -> { source, analyser, gain }
+    this.monitorInterval = null;
+  }
+
+  unlock() {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      if (!this.ctx || this.ctx.state === 'closed') {
+        this.ctx = new AudioCtx();
+        console.log('🔊 [AudioEngine] AudioContext created, sampleRate:', this.ctx.sampleRate);
       }
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      gain.gain.value = 0.0001;
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start();
-      osc.stop(ctx.currentTime + 0.05);
-      setTimeout(() => {
-        try { ctx.close(); } catch (_) {}
-      }, 200);
+      if (this.ctx.state === 'suspended') {
+        this.ctx.resume().then(() => {
+          console.log('🔊 [AudioEngine] AudioContext resumed, state: running');
+        }).catch(err => {
+          console.warn('AudioContext resume failed:', err);
+        });
+      }
+    } catch (e) {
+      console.warn('CallAudioEngine unlock error:', e);
     }
+  }
+
+  attachLocalStream(stream) {
+    if (!stream) return;
+    this.unlock();
+    try {
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+      const source = this.ctx.createMediaStreamSource(stream);
+      const analyser = this.ctx.createAnalyser();
+      analyser.fftSize = 128;
+      analyser.smoothingTimeConstant = 0.3;
+      source.connect(analyser);
+      this.localAnalyser = analyser;
+      console.log('🎙️ [AudioEngine] Local mic attached to volume analyzer');
+    } catch (e) {
+      console.warn('attachLocalStream error:', e);
+    }
+  }
+
+  attachRemoteStream(username, stream) {
+    if (!stream) return;
+    this.unlock();
+    try {
+      this.detachRemoteStream(username);
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+
+      const source = this.ctx.createMediaStreamSource(stream);
+      const analyser = this.ctx.createAnalyser();
+      analyser.fftSize = 128;
+      analyser.smoothingTimeConstant = 0.3;
+
+      const gain = this.ctx.createGain();
+      gain.gain.value = 1.0; // Crystal clear Web Audio direct to earbuds / default output device!
+
+      source.connect(analyser);
+      analyser.connect(gain);
+      gain.connect(this.ctx.destination);
+
+      this.remoteChannels.set(username, { source, analyser, gain });
+      console.log(`🎧 [AudioEngine] Remote stream for ${username} successfully routed to user output (earbuds/speakers)!`);
+    } catch (e) {
+      console.warn('attachRemoteStream error:', e);
+    }
+  }
+
+  detachRemoteStream(username) {
+    const ch = this.remoteChannels.get(username);
+    if (ch) {
+      try {
+        ch.source.disconnect();
+        ch.analyser.disconnect();
+        ch.gain.disconnect();
+      } catch (_) {}
+      this.remoteChannels.delete(username);
+    }
+  }
+
+  setVolume(factor = 1.0) {
+    this.remoteChannels.forEach(ch => {
+      if (ch.gain) {
+        ch.gain.gain.value = factor;
+      }
+    });
+  }
+
+  startMonitoring(onSpeakingUpdate) {
+    this.stopMonitoring();
+    const dataArray = new Uint8Array(64);
+
+    this.monitorInterval = setInterval(() => {
+      // Local microphone voice activity
+      if (this.localAnalyser && localStream && !isMicMuted) {
+        this.localAnalyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+        const avg = sum / dataArray.length;
+        const isSpeaking = avg > 10;
+        onSpeakingUpdate(currentUser, isSpeaking);
+      } else {
+        onSpeakingUpdate(currentUser, false);
+      }
+
+      // Remote participants voice activity
+      this.remoteChannels.forEach((ch, user) => {
+        if (ch.analyser) {
+          ch.analyser.getByteFrequencyData(dataArray);
+          let sum = 0;
+          for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+          const avg = sum / dataArray.length;
+          const isMuted = currentCallParticipants[user] && currentCallParticipants[user].muted;
+          const isSpeaking = avg > 10 && !isMuted;
+          onSpeakingUpdate(user, isSpeaking);
+        }
+      });
+    }, 120);
+  }
+
+  stopMonitoring() {
+    if (this.monitorInterval) {
+      clearInterval(this.monitorInterval);
+      this.monitorInterval = null;
+    }
+  }
+
+  cleanup() {
+    this.stopMonitoring();
+    this.remoteChannels.forEach((_, user) => this.detachRemoteStream(user));
+    this.localAnalyser = null;
+  }
+}
+
+const callAudioEngine = new CallAudioEngine();
+
+// ============================================
+// AUDIO CUES & RINGTONES
+// ============================================
+function playTone(freq1, freq2, duration = 0.18) {
+  try {
+    callAudioEngine.unlock();
+    const ctx = callAudioEngine.ctx;
+    if (!ctx) return;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq1, ctx.currentTime);
+    if (freq2) {
+      osc.frequency.setValueAtTime(freq2, ctx.currentTime + duration * 0.45);
+    }
+    gain.gain.setValueAtTime(0.08, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + duration);
   } catch (_) {}
+}
+
+function playJoinCallSound() {
+  playTone(440, 659, 0.25); // Google Meet style rising chime
+}
+
+function playLeaveCallSound() {
+  playTone(659, 392, 0.25); // Google Meet style descending chime
+}
+
+function playMuteSound(isMuted) {
+  playTone(isMuted ? 330 : 554, null, 0.1);
 }
 
 function playRingtoneSound() {
@@ -2002,76 +2161,15 @@ function stopRingtoneSound() {
     ringtoneInterval = null;
   }
   if (ringtoneAudioCtx) {
-    try { ringtoneAudioCtx.close(); } catch (e) {}
+    try { ringtoneAudioCtx.close(); } catch (_) {}
     ringtoneAudioCtx = null;
   }
 }
 
-function getPairKey(user1, user2) {
-  return [sanitizeDbKey(user1), sanitizeDbKey(user2)].sort().join('___');
-}
-
-// Route audio element to earpiece (handset receiver) or speakerphone (loudspeaker)
-async function applyAudioOutputRoute(audioEl) {
-  if (!audioEl) return;
-  audioEl.muted = false;
-  audioEl.volume = isSpeakerMode ? 1.0 : 0.85;
-
-  if ('setSinkId' in HTMLMediaElement.prototype) {
-    try {
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const audioOutputs = devices.filter(d => d.kind === 'audiooutput');
-      if (audioOutputs.length > 0) {
-        let targetId = 'default';
-        if (isSpeakerMode) {
-          const spk = audioOutputs.find(d => 
-            d.label.toLowerCase().includes('speaker') || 
-            d.label.toLowerCase().includes('loudspeaker') ||
-            d.deviceId === 'speaker'
-          );
-          targetId = spk ? spk.deviceId : 'default';
-        } else {
-          const ear = audioOutputs.find(d => 
-            d.label.toLowerCase().includes('earpiece') || 
-            d.label.toLowerCase().includes('receiver') || 
-            d.label.toLowerCase().includes('phone') || 
-            d.label.toLowerCase().includes('handset') ||
-            d.deviceId === 'earpiece'
-          );
-          if (ear) {
-            targetId = ear.deviceId;
-          }
-        }
-
-        if (targetId && audioEl.sinkId !== targetId) {
-          await audioEl.setSinkId(targetId);
-        }
-      }
-    } catch (err) {
-      console.warn('setSinkId error:', err);
-    }
-  }
-}
-
-function updateAllAudioOutputs() {
-  const audios = document.querySelectorAll('audio[id^="remote-audio-"]');
-  audios.forEach(a => applyAudioOutputRoute(a));
-  updateSpeakerButtonUI();
-}
-
-function updateSpeakerButtonUI() {
-  if (!speakerBtn) return;
-  const icon = isSpeakerMode
-    ? `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 010 14.14M15.54 8.46a5 5 0 010 7.07"/></svg>`
-    : `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>`;
-
-  speakerBtn.innerHTML = `${icon}<span>${isSpeakerMode ? 'Speaker' : 'Earpiece'}</span>`;
-  speakerBtn.classList.toggle('speaker-active', isSpeakerMode);
-  speakerBtn.classList.remove('muted');
-  speakerBtn.title = isSpeakerMode ? 'Speakerphone (Loud) — Tap for Earpiece' : 'Earpiece (Normal call) — Tap for Speaker';
-}
-
-function createRemoteAudioElement(username) {
+// ============================================
+// AUDIO ELEMENT & OUTPUT ROUTING
+// ============================================
+function getOrCreateRemoteAudio(username) {
   let existing = document.getElementById('remote-audio-' + username);
   if (!existing) {
     existing = document.createElement('audio');
@@ -2081,9 +2179,8 @@ function createRemoteAudioElement(username) {
     existing.setAttribute('playsinline', 'true');
     existing.setAttribute('webkit-playsinline', 'true');
     existing.setAttribute('autoplay', 'true');
-    existing.muted = false;
-    existing.volume = 1.0;
-    applyAudioOutputRoute(existing);
+    // HTML audio element is kept muted so Web Audio API provides the direct playback to earbuds/speakers without echo
+    existing.muted = true;
     if (remoteAudiosContainer) {
       remoteAudiosContainer.appendChild(existing);
     } else {
@@ -2096,86 +2193,27 @@ function createRemoteAudioElement(username) {
 function removeRemoteAudioElement(username) {
   const el = document.getElementById('remote-audio-' + username);
   if (el) {
+    try { el.pause(); } catch (_) {}
     el.srcObject = null;
     el.remove();
   }
+  callAudioEngine.detachRemoteStream(username);
 }
 
-function handleRemoteIceCandidate(remoteUser, candidateData) {
-  if (!candidateData) return;
-  const peerObj = peers[remoteUser];
-  if (!peerObj || !peerObj.pc) return;
-  try {
-    const cand = new RTCIceCandidate(candidateData);
-    if (peerObj.pc.remoteDescription && peerObj.pc.remoteDescription.type) {
-      peerObj.pc.addIceCandidate(cand).catch(e => console.warn('ICE add candidate error:', e));
-    } else {
-      peerObj.candidateQueue.push(cand);
-    }
-  } catch (e) {
-    console.warn('Invalid remote candidate:', e);
-  }
+function updateSpeakerButtonUI() {
+  if (!speakerBtn) return;
+  const icon = isSpeakerMode
+    ? `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 010 14.14M15.54 8.46a5 5 0 010 7.07"/></svg>`
+    : `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>`;
+
+  speakerBtn.innerHTML = `${icon}<span>${isSpeakerMode ? 'High Vol' : 'Normal'}</span>`;
+  speakerBtn.classList.toggle('speaker-active', isSpeakerMode);
+  speakerBtn.title = isSpeakerMode ? 'High Volume (100%)' : 'Normal Volume (80%)';
 }
 
-async function flushCandidates(remoteUser) {
-  const peerObj = peers[remoteUser];
-  if (!peerObj || !peerObj.pc || !peerObj.pc.remoteDescription) return;
-  while (peerObj.candidateQueue && peerObj.candidateQueue.length > 0) {
-    const cand = peerObj.candidateQueue.shift();
-    try {
-      await peerObj.pc.addIceCandidate(cand);
-    } catch (e) {
-      console.warn('ICE candidate flush error:', e);
-    }
-  }
-}
-
-function startMicAudioMonitoring() {
-  stopMicAudioMonitoring();
-  if (!localStream) return;
-  try {
-    const AudioCtx = window.AudioContext || window.webkitAudioContext;
-    if (!AudioCtx) return;
-    micAudioContext = new AudioCtx();
-    if (micAudioContext.state === 'suspended') {
-      micAudioContext.resume().catch(() => {});
-    }
-    const source = micAudioContext.createMediaStreamSource(localStream);
-    micAnalyser = micAudioContext.createAnalyser();
-    micAnalyser.fftSize = 256;
-    source.connect(micAnalyser);
-    micDataArray = new Uint8Array(micAnalyser.frequencyBinCount);
-
-    micCheckInterval = setInterval(() => {
-      if (!isInCall || !micAnalyser) return;
-      micAnalyser.getByteFrequencyData(micDataArray);
-      let sum = 0;
-      for (let i = 0; i < micDataArray.length; i++) {
-        sum += micDataArray[i];
-      }
-      const avg = sum / micDataArray.length;
-      const isSpeaking = avg > 12 && !isMicMuted;
-      updateSpeakingIndicator(currentUser, isSpeaking);
-    }, 150);
-  } catch (e) {
-    console.warn('Mic monitoring error:', e);
-  }
-}
-
-function stopMicAudioMonitoring() {
-  if (micCheckInterval) {
-    clearInterval(micCheckInterval);
-    micCheckInterval = null;
-  }
-  if (micAudioContext) {
-    try { micAudioContext.close(); } catch (_) {}
-    micAudioContext = null;
-  }
-  micAnalyser = null;
-  micDataArray = null;
-  updateSpeakingIndicator(currentUser, false);
-}
-
+// ============================================
+// SPEAKING INDICATORS & PARTICIPANT UI
+// ============================================
 function updateSpeakingIndicator(username, isSpeaking) {
   speakingUsers[username] = isSpeaking;
   const card = document.getElementById('participant-card-' + username);
@@ -2203,9 +2241,11 @@ function renderCallParticipantsGrid(participants) {
     const isMe = (user === currentUser);
     const data = participants[user] || {};
     const isSpeaking = !!speakingUsers[user];
+    const isMuted = !!data.muted;
+
     const card = document.createElement('div');
     card.id = 'participant-card-' + user;
-    card.className = 'participant-card in-call' + (data.muted ? ' muted' : '') + (isSpeaking ? ' speaking' : '');
+    card.className = 'participant-card in-call' + (isMuted ? ' muted' : '') + (isSpeaking ? ' speaking' : '');
 
     const avatar = document.createElement('div');
     avatar.className = 'p-avatar';
@@ -2215,9 +2255,14 @@ function renderCallParticipantsGrid(participants) {
     name.className = 'p-name';
     name.textContent = isMe ? `${user} (You)` : user;
 
+    // Animated sound wave bars like Google Meet
+    const wave = document.createElement('div');
+    wave.className = 'p-wave';
+    wave.innerHTML = '<span></span><span></span><span></span>';
+
     const tag = document.createElement('div');
     tag.className = 'p-tag';
-    if (data.muted) {
+    if (isMuted) {
       tag.textContent = 'Muted 🔇';
     } else if (isSpeaking) {
       tag.textContent = 'Speaking 🎙️';
@@ -2227,6 +2272,7 @@ function renderCallParticipantsGrid(participants) {
 
     card.appendChild(avatar);
     card.appendChild(name);
+    card.appendChild(wave);
     card.appendChild(tag);
     callParticipantsGrid.appendChild(card);
   });
@@ -2251,142 +2297,168 @@ function updateCallBanner(count, participants) {
 }
 
 // ============================================
-// WEBRTC PEER CONNECTIONS
+// ICE CANDIDATE QUEUE & HANDLING
 // ============================================
-function setupAudioElement(audioEl, remoteUser, stream) {
-  audioEl.srcObject = stream;
-  audioEl.muted = false;
-  audioEl.volume = 1.0;
-  audioEl.autoplay = true;
-  audioEl.setAttribute('autoplay', 'true');
-  audioEl.setAttribute('playsinline', 'true');
+function handleRemoteCandidate(remoteUser, candidateData) {
+  if (!candidateData || !candidateData.candidate) return;
+  const peer = peers[remoteUser];
+  if (!peer || !peer.pc) return;
 
-  // Force unmute and play (mobile workaround)
-  const tryPlay = () => {
-    if (!audioEl.srcObject) return;
-    audioEl.muted = false;
-    audioEl.volume = 1.0;
-    applyAudioOutputRoute(audioEl);
-    audioEl.play().then(() => {
-      console.log('Audio playing for', remoteUser);
-    }).catch(e => {
-      console.warn('Audio play failed for', remoteUser, e);
-      setTimeout(tryPlay, 1000);
-    });
-  };
-  tryPlay();
+  const candStr = candidateData.candidate;
+  if (peer.seenCandidates && peer.seenCandidates.has(candStr)) return;
+  if (peer.seenCandidates) peer.seenCandidates.add(candStr);
+
+  try {
+    const cand = new RTCIceCandidate(candidateData);
+    if (peer.pc.remoteDescription && peer.pc.remoteDescription.type) {
+      peer.pc.addIceCandidate(cand).catch(err => {
+        console.warn('ICE add candidate error:', err.message);
+      });
+    } else {
+      peer.candidateQueue.push(cand);
+    }
+  } catch (err) {
+    console.warn('Invalid remote candidate:', err);
+  }
 }
 
-function setupPeerConnectionEvents(pc, remoteUser, audioEl, pairKey) {
+async function flushCandidates(remoteUser) {
+  const peer = peers[remoteUser];
+  if (!peer || !peer.pc || !peer.pc.remoteDescription) return;
+  while (peer.candidateQueue && peer.candidateQueue.length > 0) {
+    const cand = peer.candidateQueue.shift();
+    try {
+      await peer.pc.addIceCandidate(cand);
+    } catch (err) {
+      console.warn('ICE candidate flush error:', err.message);
+    }
+  }
+}
+
+// ============================================
+// WEBRTC PEER CONNECTION LIFECYCLE
+// ============================================
+function setupPeerEvents(pc, remoteUser, audioEl, pairKey) {
+  const safeMe = sanitizeDbKey(currentUser);
+  const safeRemote = sanitizeDbKey(remoteUser);
+
   pc.ontrack = (event) => {
-    console.log('=== GOT REMOTE TRACK from', remoteUser, '===', event.track.kind, 'readyState:', event.track.readyState);
+    console.log(`🎉 [WebRTC] GOT REMOTE AUDIO TRACK from ${remoteUser}! kind: ${event.track.kind}, enabled: ${event.track.enabled}`);
     stopRingtoneSound();
+    playJoinCallSound();
+
     const stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
 
-    // Monitor track state
-    event.track.onended = () => console.warn('Remote track ended from', remoteUser);
-    event.track.onmute = () => console.warn('Remote track muted from', remoteUser);
-    event.track.onunmute = () => console.log('Remote track unmuted from', remoteUser);
+    // Attach stream to HTML audio element for MediaStream activation
+    audioEl.srcObject = stream;
+    audioEl.play().catch(() => {});
 
-    setupAudioElement(audioEl, remoteUser, stream);
-    callStatusText.textContent = 'Live Voice Call';
+    // Attach stream to Web Audio Engine for volume analysis & direct earbud/speaker playback
+    callAudioEngine.attachRemoteStream(remoteUser, stream);
+
+    if (callStatusText) callStatusText.textContent = 'Live Voice Call';
   };
 
   pc.onicecandidate = (event) => {
-    if (event.candidate && currentRoom) {
-      db.ref(`calls/${currentRoom}/signals/${pairKey}/ice_${currentUser}`).push(event.candidate.toJSON());
+    if (event.candidate && event.candidate.candidate && currentRoom) {
+      console.log(`📡 [WebRTC] Generated local ICE candidate for ${remoteUser}`);
+      db.ref(`calls/${currentRoom}/signals/${pairKey}/candidates/${safeMe}`).push(event.candidate.toJSON());
     }
   };
 
-  pc.oniceconnectionstatechange = () => {
-    console.log('ICE connection state with', remoteUser, ':', pc.iceConnectionState);
-    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-      stopRingtoneSound();
-      callStatusText.textContent = 'Live Voice Call';
-    } else if (pc.iceConnectionState === 'failed') {
-      console.warn('ICE connection failed with', remoteUser);
-      if (isInCall && currentCallParticipants[remoteUser] && currentUser > remoteUser) {
-        console.log('Attempting reconnect with', remoteUser);
-        setTimeout(() => {
-          if (isInCall && currentCallParticipants[remoteUser]) {
-            initiatePeerConnection(remoteUser);
-          }
-        }, 2000);
-      }
-    } else if (pc.iceConnectionState === 'disconnected') {
-      setTimeout(() => {
-        if (pc.iceConnectionState === 'disconnected' && isInCall && currentCallParticipants[remoteUser] && currentUser > remoteUser) {
-          console.warn('ICE still disconnected, reconnecting with', remoteUser);
-          initiatePeerConnection(remoteUser);
-        }
-      }, 5000);
-    }
-  };
-
-  pc.onconnectionstatechange = () => {
-    console.log('Connection state with', remoteUser, ':', pc.connectionState);
-    if (pc.connectionState === 'connected') {
-      stopRingtoneSound();
-      callStatusText.textContent = 'Live Voice Call';
-    } else if (pc.connectionState === 'failed') {
-      console.warn('Connection failed with', remoteUser, '\u2014 retrying in 2s');
-      setTimeout(() => {
-        if (isInCall && currentCallParticipants[remoteUser] && currentUser > remoteUser) {
-          initiatePeerConnection(remoteUser);
-        }
-      }, 2000);
-    }
-  };
-
-  // Listen for ICE candidates from the other side
-  db.ref(`calls/${currentRoom}/signals/${pairKey}/ice_${remoteUser}`).on('child_added', (snap) => {
-    handleRemoteIceCandidate(remoteUser, snap.val());
+  // Listen for remote ICE candidates
+  const candRef = db.ref(`calls/${currentRoom}/signals/${pairKey}/candidates/${safeRemote}`);
+  candRef.off();
+  candRef.on('child_added', (snap) => {
+    handleRemoteCandidate(remoteUser, snap.val());
   });
+
+  const checkConnection = () => {
+    const ice = pc.iceConnectionState;
+    const conn = pc.connectionState;
+    console.log(`🔗 [WebRTC:${remoteUser}] Connection: ${conn}, ICE: ${ice}`);
+
+    if (ice === 'connected' || ice === 'completed' || conn === 'connected') {
+      stopRingtoneSound();
+      if (callStatusText) callStatusText.textContent = 'Live Voice Call';
+      if (peers[remoteUser] && peers[remoteUser].reconnectTimeout) {
+        clearTimeout(peers[remoteUser].reconnectTimeout);
+        peers[remoteUser].reconnectTimeout = null;
+      }
+    } else if (ice === 'failed' || conn === 'failed') {
+      console.warn(`⚠️ [WebRTC] Connection failed with ${remoteUser}. Auto-recovering...`);
+      triggerAutoRecovery(remoteUser);
+    } else if (ice === 'disconnected' || conn === 'disconnected') {
+      if (peers[remoteUser] && !peers[remoteUser].reconnectTimeout) {
+        peers[remoteUser].reconnectTimeout = setTimeout(() => {
+          if (isInCall && currentCallParticipants[remoteUser]) {
+            console.warn(`⚠️ [WebRTC] Still disconnected from ${remoteUser} after 3s, recovering...`);
+            triggerAutoRecovery(remoteUser);
+          }
+        }, 3000);
+      }
+    }
+  };
+
+  pc.oniceconnectionstatechange = checkConnection;
+  pc.onconnectionstatechange = checkConnection;
 }
 
-async function initiatePeerConnection(remoteUser) {
-  if (!isInCall || !localStream) return;
-  if (remoteUser === currentUser) return;
+function triggerAutoRecovery(remoteUser) {
+  if (!isInCall || !currentCallParticipants[remoteUser]) return;
+  // Deterministic: only the initiator restarts ICE to prevent glare
+  if (currentUser > remoteUser) {
+    console.log(`🔄 [WebRTC] Restarting ICE with ${remoteUser}`);
+    initiatePeerConnection(remoteUser, true);
+  }
+}
+
+async function initiatePeerConnection(remoteUser, isRestart = false) {
+  if (!isInCall || !localStream || remoteUser === currentUser) return;
 
   const pairKey = getPairKey(currentUser, remoteUser);
-  console.log('=== INITIATING peer connection to:', remoteUser, 'pairKey:', pairKey, '===');
+  console.log(`🚀 [WebRTC] INITIATING peer connection to: ${remoteUser} (pair: ${pairKey})`);
 
-  // Close previous connection if exists
+  // Close existing PC if any
   if (peers[remoteUser]) {
     try {
-      db.ref(`calls/${currentRoom}/signals/${pairKey}/ice_${remoteUser}`).off();
       peers[remoteUser].pc.close();
-    } catch (e) {}
-    removeRemoteAudioElement(remoteUser);
-    delete peers[remoteUser];
+    } catch (_) {}
   }
 
-  // Clear stale signals for this pair before initiating
+  // Clear stale candidates and answers before creating new offer
   try {
     await db.ref(`calls/${currentRoom}/signals/${pairKey}`).remove();
   } catch (_) {}
 
-  // Small delay to ensure Firebase remove completes
-  await new Promise(r => setTimeout(r, 200));
-
+  const offerToken = 'tok_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
   const pc = new RTCPeerConnection(ICE_SERVERS);
-  const audioEl = createRemoteAudioElement(remoteUser);
-  const peerObj = { pc, audioEl, candidateQueue: [], answered: false };
+  const audioEl = getOrCreateRemoteAudio(remoteUser);
+  const peerObj = {
+    pc,
+    audioEl,
+    candidateQueue: [],
+    seenCandidates: new Set(),
+    currentOfferToken: offerToken,
+    lastProcessedToken: '',
+    isInitiator: true,
+    reconnectTimeout: null
+  };
   peers[remoteUser] = peerObj;
 
   // Add local audio tracks
   localStream.getAudioTracks().forEach(track => {
     track.enabled = !isMicMuted;
     pc.addTrack(track, localStream);
-    console.log('Added local track:', track.label, 'enabled:', track.enabled);
+    console.log(`🎤 [WebRTC] Added local track: ${track.label} (enabled: ${track.enabled})`);
   });
 
-  setupPeerConnectionEvents(pc, remoteUser, audioEl, pairKey);
+  setupPeerEvents(pc, remoteUser, audioEl, pairKey);
 
   try {
     const offer = await pc.createOffer({
       offerToReceiveAudio: true,
-      voiceActivityDetection: true
+      iceRestart: isRestart
     });
     await pc.setLocalDescription(offer);
 
@@ -2395,141 +2467,130 @@ async function initiatePeerConnection(remoteUser) {
       to: remoteUser,
       type: offer.type,
       sdp: pc.localDescription.sdp,
-      ts: Date.now()
+      token: offerToken
     };
 
     await db.ref(`calls/${currentRoom}/signals/${pairKey}/offer`).set(offerData);
-    console.log('Offer sent to', remoteUser, 'sdp length:', offerData.sdp.length);
+    console.log(`📤 [WebRTC] Offer sent to ${remoteUser} with token: ${offerToken}`);
 
-    // Listen for answer
-    db.ref(`calls/${currentRoom}/signals/${pairKey}/answer`).on('value', async (snap) => {
+    // Listen for answer with matching token
+    const answerRef = db.ref(`calls/${currentRoom}/signals/${pairKey}/answer`);
+    answerRef.off();
+    answerRef.on('value', async (snap) => {
       const answer = snap.val();
       if (!answer || answer.to !== currentUser) return;
-      if (!peers[remoteUser] || peers[remoteUser].answered) return;
-      if (pc.signalingState !== 'have-local-offer') {
-        console.warn('Ignoring answer \u2014 wrong signaling state:', pc.signalingState);
-        return;
-      }
-      if (answer.ts && answer.ts < offerData.ts) return;
+      if (answer.token !== peerObj.currentOfferToken) return;
+      if (pc.signalingState !== 'have-local-offer') return;
 
       try {
-        peers[remoteUser].answered = true;
-        console.log('Setting remote answer from', remoteUser, 'sdp length:', answer.sdp.length);
+        console.log(`📥 [WebRTC] Received remote answer from ${remoteUser}! Applying...`);
         await pc.setRemoteDescription(new RTCSessionDescription({ type: answer.type, sdp: answer.sdp }));
         await flushCandidates(remoteUser);
-        console.log('=== Answer set from', remoteUser, '\u2014 media should flow now ===');
-        callStatusText.textContent = 'Live Voice Call';
+        console.log(`✅ [WebRTC] Peer connection complete with ${remoteUser}!`);
+        if (callStatusText) callStatusText.textContent = 'Live Voice Call';
       } catch (e) {
-        console.error('Error setting answer from', remoteUser, e);
-        peers[remoteUser].answered = false;
+        console.error(`Error setting answer from ${remoteUser}:`, e);
       }
     });
 
   } catch (err) {
-    console.error('Error creating offer to', remoteUser, err);
+    console.error(`Error creating offer to ${remoteUser}:`, err);
   }
 }
-
-// Track active offer listeners to avoid duplicates
-let activeOfferListeners = {};
 
 function listenForIncomingOffers() {
   if (!currentRoom || isListeningForOffers) return;
   isListeningForOffers = true;
-  activeOfferListeners = {};
 
-  const handleOfferSignal = async (snap) => {
+  const safeMe = sanitizeDbKey(currentUser);
+  const signalsRef = db.ref(`calls/${currentRoom}/signals`);
+
+  const handleSignalChild = (snap) => {
     const pairKey = snap.key;
-    if (!pairKey) return;
-    const parts = pairKey.split('___');
-    if (!parts.includes(sanitizeDbKey(currentUser))) return;
+    if (!pairKey || !pairKey.includes(safeMe)) return;
 
-    // Don't create duplicate listeners for the same pairKey
-    if (activeOfferListeners[pairKey]) return;
-    activeOfferListeners[pairKey] = true;
-
-    db.ref(`calls/${currentRoom}/signals/${pairKey}/offer`).on('value', async (offerSnap) => {
+    const offerRef = db.ref(`calls/${currentRoom}/signals/${pairKey}/offer`);
+    offerRef.off();
+    offerRef.on('value', async (offerSnap) => {
       const offer = offerSnap.val();
       if (!offer || offer.to !== currentUser) return;
       if (!isInCall || !localStream) return;
 
       const remoteUser = offer.from;
-      if (remoteUser === currentUser) return;
-      if (offer.ts && callStartTime && offer.ts < (callStartTime - 10000)) {
-        console.log('Ignoring stale offer from before call start');
+      if (!remoteUser || remoteUser === currentUser) return;
+
+      // Avoid re-processing same offer token
+      if (peers[remoteUser] && peers[remoteUser].lastProcessedToken === offer.token) {
         return;
       }
 
-      // If already connected with this exact offer, do not re-answer
-      if (peers[remoteUser] && peers[remoteUser].lastOfferTs === offer.ts) {
-        const state = peers[remoteUser].pc.connectionState || peers[remoteUser].pc.iceConnectionState;
-        if (state === 'connected' || state === 'completed') {
-          return;
-        }
-      }
+      console.log(`📥 [WebRTC] Incoming offer from ${remoteUser} (token: ${offer.token})`);
 
-      console.log('=== INCOMING offer from', remoteUser, 'ts:', offer.ts, '===');
-
-      // Clean up previous peer connection if any
       if (peers[remoteUser]) {
-        try {
-          db.ref(`calls/${currentRoom}/signals/${pairKey}/ice_${remoteUser}`).off();
-          peers[remoteUser].pc.close();
-        } catch (e) {}
-        removeRemoteAudioElement(remoteUser);
-        delete peers[remoteUser];
+        try { peers[remoteUser].pc.close(); } catch (_) {}
       }
 
       const pc = new RTCPeerConnection(ICE_SERVERS);
-      const audioEl = createRemoteAudioElement(remoteUser);
-      const peerObj = { pc, audioEl, candidateQueue: [], answered: false, lastOfferTs: offer.ts };
+      const audioEl = getOrCreateRemoteAudio(remoteUser);
+      const peerObj = {
+        pc,
+        audioEl,
+        candidateQueue: [],
+        seenCandidates: new Set(),
+        currentOfferToken: '',
+        lastProcessedToken: offer.token,
+        isInitiator: false,
+        reconnectTimeout: null
+      };
       peers[remoteUser] = peerObj;
 
       localStream.getAudioTracks().forEach(track => {
         track.enabled = !isMicMuted;
         pc.addTrack(track, localStream);
-        console.log('Added local track for answer:', track.label, 'enabled:', track.enabled);
       });
 
-      setupPeerConnectionEvents(pc, remoteUser, audioEl, pairKey);
+      setupPeerEvents(pc, remoteUser, audioEl, pairKey);
 
       try {
-        console.log('Setting remote offer from', remoteUser, 'sdp length:', offer.sdp.length);
         await pc.setRemoteDescription(new RTCSessionDescription({ type: offer.type, sdp: offer.sdp }));
         await flushCandidates(remoteUser);
 
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
 
-        await db.ref(`calls/${currentRoom}/signals/${pairKey}/answer`).set({
+        const answerData = {
           from: currentUser,
           to: remoteUser,
           type: answer.type,
           sdp: pc.localDescription.sdp,
-          ts: Date.now()
-        });
+          token: offer.token // Echo initiator's token back
+        };
 
-        peerObj.answered = true;
-        console.log('=== Answer sent to', remoteUser, '\u2014 waiting for media ===');
+        await db.ref(`calls/${currentRoom}/signals/${pairKey}/answer`).set(answerData);
+        console.log(`📤 [WebRTC] Answer sent to ${remoteUser} (echoed token: ${offer.token})`);
       } catch (err) {
-        console.error('Error answering offer from', remoteUser, err);
+        console.error(`Error answering offer from ${remoteUser}:`, err);
       }
     });
   };
 
-  db.ref(`calls/${currentRoom}/signals`).on('child_added', handleOfferSignal);
-  db.ref(`calls/${currentRoom}/signals`).on('child_changed', handleOfferSignal);
+  signalsRef.on('child_added', handleSignalChild);
+  signalsRef.on('child_changed', handleSignalChild);
 }
 
 function closePeerConnection(username) {
   const peerObj = peers[username];
   if (peerObj) {
-    try { peerObj.pc.close(); } catch (e) {}
+    if (peerObj.reconnectTimeout) {
+      clearTimeout(peerObj.reconnectTimeout);
+    }
+    try { peerObj.pc.close(); } catch (_) {}
     removeRemoteAudioElement(username);
     delete peers[username];
+
     if (currentRoom) {
       const pairKey = getPairKey(currentUser, username);
-      db.ref(`calls/${currentRoom}/signals/${pairKey}`).remove();
+      db.ref(`calls/${currentRoom}/signals/${pairKey}`).remove().catch(() => {});
     }
   }
 }
@@ -2549,7 +2610,6 @@ function listenForCalls() {
     if (count > 0) {
       voiceCallBtn.classList.add('active');
 
-      // Only show incoming call + ringtone if NOT in call, NOT joining, and NOT dismissed
       if (!isInCall && !isJoiningCall && !hasDismissedCallModal) {
         const callerName = Object.keys(participants)[0];
         incomingCallerName.textContent = callerName;
@@ -2574,7 +2634,10 @@ function listenForCalls() {
         if (user !== currentUser && !peers[user]) {
           // The lexicographically greater username initiates the offer
           if (currentUser > user) {
+            console.log(`👑 [Call] I (${currentUser}) will initiate offer to ${user}`);
             initiatePeerConnection(user);
+          } else {
+            console.log(`⏳ [Call] Waiting for offer from ${user} to ${currentUser}`);
           }
         }
       });
@@ -2582,6 +2645,7 @@ function listenForCalls() {
       // Disconnect left participants
       Object.keys(peers).forEach(user => {
         if (!participants[user]) {
+          console.log(`🚪 [Call] Participant ${user} left call, closing peer.`);
           closePeerConnection(user);
         }
       });
@@ -2611,8 +2675,10 @@ async function joinGroupCall() {
     return;
   }
 
-  // Prime browser audio engine during user click gesture
-  unlockAudioPlayback();
+  console.log(`📞 [Call] User ${currentUser} is joining group call in room ${currentRoom}...`);
+
+  // Prime persistent Web Audio Context on user click gesture
+  callAudioEngine.unlock();
 
   isJoiningCall = true;
   stopRingtoneSound();
@@ -2624,7 +2690,7 @@ async function joinGroupCall() {
   callTimerEl.textContent = '00:00';
 
   try {
-    // Robust audio constraints for voice
+    // Robust audio constraints compatible with all hardware and earbuds
     const audioConstraints = {
       echoCancellation: true,
       noiseSuppression: true,
@@ -2634,7 +2700,7 @@ async function joinGroupCall() {
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints, video: false });
     } catch (constraintErr) {
-      console.warn('Standard constraints failed, using audio: true fallback', constraintErr);
+      console.warn('Standard constraints fallback to audio: true', constraintErr);
       localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
     }
 
@@ -2645,6 +2711,7 @@ async function joinGroupCall() {
 
     audioTracks.forEach(track => {
       track.enabled = true;
+      console.log(`🎤 [Mic] Captured track: "${track.label}", settings:`, track.getSettings ? track.getSettings() : {});
     });
 
     isMicMuted = false;
@@ -2652,8 +2719,26 @@ async function joinGroupCall() {
     isJoiningCall = false;
 
     stopRingtoneSound();
+    playJoinCallSound();
     startCallTimer();
-    startMicAudioMonitoring();
+
+    // Attach local stream to Web Audio Engine for speaking detection
+    callAudioEngine.attachLocalStream(localStream);
+    callAudioEngine.startMonitoring((user, isSpeaking) => {
+      updateSpeakingIndicator(user, isSpeaking);
+    });
+
+    // MediaSession: keep background voice alive on mobile/desktop
+    if ('mediaSession' in navigator) {
+      try {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: 'Live Voice Call',
+          artist: 'Room: ' + currentRoom,
+          album: 'Chatttt Voice'
+        });
+        navigator.mediaSession.playbackState = 'playing';
+      } catch (_) {}
+    }
 
     callStatusText.textContent = 'Live Voice Call';
     voiceCallBtn.classList.add('active');
@@ -2664,7 +2749,7 @@ async function joinGroupCall() {
     isSpeakerMode = true;
     updateSpeakerButtonUI();
 
-    // Register self as participant — onDisconnect auto-removes
+    // Register self as participant — onDisconnect auto-removes on tab close
     const myRef = db.ref(`calls/${currentRoom}/participants/${currentUser}`);
     await myRef.set({ joinedAt: firebase.database.ServerValue.TIMESTAMP, muted: false });
     myRef.onDisconnect().remove();
@@ -2676,17 +2761,21 @@ async function joinGroupCall() {
     const snap = await db.ref(`calls/${currentRoom}/participants`).once('value');
     const existing = snap.val() || {};
     const others = Object.keys(existing).filter(u => u !== currentUser);
+    console.log(`👥 [Call] Existing participants in call:`, others);
 
     others.forEach(user => {
       if (currentUser > user) {
+        console.log(`👑 [Call] I will initiate offer to ${user}`);
         initiatePeerConnection(user);
+      } else {
+        console.log(`⏳ [Call] Waiting for offer from ${user}`);
       }
     });
 
     if (others.length === 0) {
-      showToast('Voice call started! Others in this room will see a banner to join.');
+      showToast('Voice call started! Others in this room can join anytime.');
     } else {
-      showToast(`Joining call with ${others.join(', ')}...`);
+      showToast(`Joined voice call with ${others.join(', ')}! 🎙️`);
     }
 
   } catch (err) {
@@ -2702,12 +2791,20 @@ async function joinGroupCall() {
 }
 
 function leaveGroupCall(updateDb = true) {
+  console.log(`👋 [Call] Leaving voice call...`);
   stopRingtoneSound();
-  stopMicAudioMonitoring();
+  playLeaveCallSound();
+  callAudioEngine.cleanup();
+
   isInCall = false;
   isJoiningCall = false;
   isListeningForOffers = false;
-  activeOfferListeners = {};
+
+  if ('mediaSession' in navigator) {
+    try {
+      navigator.mediaSession.playbackState = 'none';
+    } catch (_) {}
+  }
 
   if (currentRoom) {
     try {
@@ -2720,22 +2817,17 @@ function leaveGroupCall(updateDb = true) {
     // Clean up signals involving currentUser
     db.ref(`calls/${currentRoom}/signals`).once('value', (snap) => {
       const all = snap.val() || {};
+      const safeMe = sanitizeDbKey(currentUser);
       Object.keys(all).forEach(k => {
-        if (k.includes(sanitizeDbKey(currentUser))) {
+        if (k.includes(safeMe)) {
           db.ref(`calls/${currentRoom}/signals/${k}`).remove();
         }
       });
     });
   }
 
-  // Turn off all Firebase signal listeners for our peers before closing connections
+  // Close and clean all peers
   Object.keys(peers).forEach(user => {
-    const pairKey = getPairKey(currentUser, user);
-    try {
-      db.ref(`calls/${currentRoom}/signals/${pairKey}/ice_${user}`).off();
-      db.ref(`calls/${currentRoom}/signals/${pairKey}/answer`).off();
-      db.ref(`calls/${currentRoom}/signals/${pairKey}/offer`).off();
-    } catch (e) {}
     closePeerConnection(user);
   });
   peers = {};
@@ -2760,7 +2852,6 @@ function leaveGroupCall(updateDb = true) {
   muteBtn.classList.remove('muted');
   muteBtn.querySelector('span').textContent = 'Mute';
 
-  // Reset speaker state
   isSpeakerMode = true;
   updateSpeakerButtonUI();
 
@@ -2817,6 +2908,8 @@ muteBtn.addEventListener('click', () => {
     muteBtn.classList.toggle('muted', isMicMuted);
     muteBtn.querySelector('span').textContent = isMicMuted ? 'Unmute' : 'Mute';
 
+    playMuteSound(isMicMuted);
+
     if (currentRoom && currentUser) {
       db.ref(`calls/${currentRoom}/participants/${currentUser}/muted`).set(isMicMuted);
     }
@@ -2826,9 +2919,10 @@ muteBtn.addEventListener('click', () => {
 
 speakerBtn.addEventListener('click', () => {
   isSpeakerMode = !isSpeakerMode;
-  updateAllAudioOutputs();
-  showToast(isSpeakerMode ? '🔊 Speakerphone (Loud)' : '👂 Earpiece mode (Normal call)');
-  console.log('Audio output toggled. Speaker mode:', isSpeakerMode);
+  callAudioEngine.setVolume(isSpeakerMode ? 1.0 : 0.7);
+  updateSpeakerButtonUI();
+  showToast(isSpeakerMode ? '🔊 Volume 100%' : '🔉 Volume 70%');
+  console.log('Volume toggled. High Volume mode:', isSpeakerMode);
 });
 
 // ============================================

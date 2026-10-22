@@ -1848,6 +1848,42 @@ input::-webkit-contacts-auto-fill-button {
   font-weight: 600;
 }
 
+.p-wave {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  height: 12px;
+  margin: 2px 0;
+}
+
+.participant-card.speaking .p-wave {
+  display: flex;
+}
+
+.p-wave span {
+  width: 3px;
+  height: 100%;
+  background: #25d366;
+  border-radius: 2px;
+  animation: wave-bar 0.6s ease-in-out infinite alternate;
+}
+
+.p-wave span:nth-child(2) {
+  animation-delay: 0.15s;
+  height: 60%;
+}
+
+.p-wave span:nth-child(3) {
+  animation-delay: 0.3s;
+  height: 80%;
+}
+
+@keyframes wave-bar {
+  0% { transform: scaleY(0.25); }
+  100% { transform: scaleY(1); }
+}
+
 .call-controls {
   display: flex;
   justify-content: center;
