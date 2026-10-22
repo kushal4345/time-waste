@@ -1936,6 +1936,7 @@ let isInCall = false;
 let isJoiningCall = false;
 let isMicMuted = false;
 let isSpeakerMode = true; // Default to loudspeaker
+let currentCallVolume = 0.8; // Default comfortable volume (80%)
 let callStartTime = null;
 let callTimerInterval = null;
 let currentCallParticipants = {};
@@ -1957,7 +1958,7 @@ class CallAudioEngine {
   constructor() {
     this.ctx = null;
     this.localAnalyser = null;
-    this.remoteChannels = new Map(); // username -> { source, analyser, gain }
+    this.remoteChannels = new Map(); // username -> { source, analyser, gain, audioEl, isWebAudioActive }
     this.monitorInterval = null;
   }
 
@@ -1998,7 +1999,7 @@ class CallAudioEngine {
     }
   }
 
-  attachRemoteStream(username, stream) {
+  attachRemoteStream(username, stream, audioEl) {
     if (!stream) return;
     this.unlock();
     try {
@@ -2011,17 +2012,44 @@ class CallAudioEngine {
       analyser.smoothingTimeConstant = 0.3;
 
       const gain = this.ctx.createGain();
-      gain.gain.value = 1.0; // Crystal clear Web Audio direct to earbuds / default output device!
+      // Web Audio gain starts at 0 while HTML audioEl is playing to prevent echo/double audio.
+      // If HTML audioEl is blocked by autoplay policies, Web Audio gain takes over at currentCallVolume!
+      gain.gain.value = 0.0;
 
       source.connect(analyser);
       analyser.connect(gain);
       gain.connect(this.ctx.destination);
 
-      this.remoteChannels.set(username, { source, analyser, gain });
-      console.log(`🎧 [AudioEngine] Remote stream for ${username} successfully routed to user output (earbuds/speakers)!`);
+      this.remoteChannels.set(username, { source, analyser, gain, audioEl, isWebAudioActive: false });
+      console.log(`🎧 [AudioEngine] Attached remote stream analyzer for ${username}`);
     } catch (e) {
       console.warn('attachRemoteStream error:', e);
     }
+  }
+
+  setWebAudioFallback(username, active) {
+    const ch = this.remoteChannels.get(username);
+    if (!ch) return;
+    ch.isWebAudioActive = active;
+    if (active) {
+      ch.gain.gain.value = currentCallVolume;
+      console.log(`🎧 [AudioEngine] Fallback Web Audio output activated for ${username} at volume: ${currentCallVolume}`);
+    } else {
+      ch.gain.gain.value = 0.0;
+    }
+  }
+
+  updateVolume(volume) {
+    currentCallVolume = volume;
+    this.remoteChannels.forEach(ch => {
+      if (ch.audioEl) {
+        ch.audioEl.volume = volume;
+      }
+      if (ch.isWebAudioActive && ch.gain) {
+        ch.gain.gain.value = volume;
+      }
+    });
+    console.log(`🔊 [AudioEngine] Volume updated to ${Math.round(volume * 100)}%`);
   }
 
   detachRemoteStream(username) {
@@ -2034,14 +2062,6 @@ class CallAudioEngine {
       } catch (_) {}
       this.remoteChannels.delete(username);
     }
-  }
-
-  setVolume(factor = 1.0) {
-    this.remoteChannels.forEach(ch => {
-      if (ch.gain) {
-        ch.gain.gain.value = factor;
-      }
-    });
   }
 
   startMonitoring(onSpeakingUpdate) {
@@ -2088,9 +2108,7 @@ class CallAudioEngine {
     this.remoteChannels.forEach((_, user) => this.detachRemoteStream(user));
     this.localAnalyser = null;
   }
-}
-
-const callAudioEngine = new CallAudioEngine();
+}const callAudioEngine = new CallAudioEngine();
 
 // ============================================
 // AUDIO CUES & RINGTONES
@@ -2179,8 +2197,9 @@ function getOrCreateRemoteAudio(username) {
     existing.setAttribute('playsinline', 'true');
     existing.setAttribute('webkit-playsinline', 'true');
     existing.setAttribute('autoplay', 'true');
-    // HTML audio element is kept muted so Web Audio API provides the direct playback to earbuds/speakers without echo
-    existing.muted = true;
+    // Unmuted with volume so that phone hardware routes to earbuds / Bluetooth and volume buttons work!
+    existing.muted = false;
+    existing.volume = currentCallVolume;
     if (remoteAudiosContainer) {
       remoteAudiosContainer.appendChild(existing);
     } else {
@@ -2204,11 +2223,11 @@ function updateSpeakerButtonUI() {
   if (!speakerBtn) return;
   const icon = isSpeakerMode
     ? `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 010 14.14M15.54 8.46a5 5 0 010 7.07"/></svg>`
-    : `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>`;
+    : `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 010 7.07"/></svg>`;
 
-  speakerBtn.innerHTML = `${icon}<span>${isSpeakerMode ? 'High Vol' : 'Normal'}</span>`;
+  speakerBtn.innerHTML = `${icon}<span>${isSpeakerMode ? 'Boost' : 'Normal'}</span>`;
   speakerBtn.classList.toggle('speaker-active', isSpeakerMode);
-  speakerBtn.title = isSpeakerMode ? 'High Volume (100%)' : 'Normal Volume (80%)';
+  speakerBtn.title = isSpeakerMode ? 'Boost Volume (100%)' : 'Normal Volume (60%)';
 }
 
 // ============================================
@@ -2349,12 +2368,24 @@ function setupPeerEvents(pc, remoteUser, audioEl, pairKey) {
 
     const stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
 
-    // Attach stream to HTML audio element for MediaStream activation
+    // Attach stream to HTML audio element with unmuted volume for earbud & hardware volume control
     audioEl.srcObject = stream;
-    audioEl.play().catch(() => {});
+    audioEl.muted = false;
+    audioEl.volume = currentCallVolume;
 
-    // Attach stream to Web Audio Engine for volume analysis & direct earbud/speaker playback
-    callAudioEngine.attachRemoteStream(remoteUser, stream);
+    // Attach stream to Web Audio Engine for volume analysis
+    callAudioEngine.attachRemoteStream(remoteUser, stream, audioEl);
+
+    const playPromise = audioEl.play();
+    if (playPromise !== undefined) {
+      playPromise.then(() => {
+        console.log(`🔊 [Audio] Direct audio active for ${remoteUser} at volume ${currentCallVolume}. Earbuds/phone volume buttons ACTIVE.`);
+        callAudioEngine.setWebAudioFallback(remoteUser, false);
+      }).catch(err => {
+        console.warn(`⚠️ [Audio] audioEl.play() blocked by browser autoplay, switching to WebAudio fallback:`, err.message);
+        callAudioEngine.setWebAudioFallback(remoteUser, true);
+      });
+    }
 
     if (callStatusText) callStatusText.textContent = 'Live Voice Call';
   };
@@ -2917,12 +2948,28 @@ muteBtn.addEventListener('click', () => {
   }
 });
 
+// In-Call Volume Slider Listener
+const callVolumeSlider = $('call-volume-slider');
+const callVolumeVal = $('call-volume-val');
+
+if (callVolumeSlider) {
+  callVolumeSlider.addEventListener('input', (e) => {
+    const val = parseInt(e.target.value, 10);
+    const vol = val / 100;
+    if (callVolumeVal) callVolumeVal.textContent = val + '%';
+    callAudioEngine.updateVolume(vol);
+  });
+}
+
 speakerBtn.addEventListener('click', () => {
   isSpeakerMode = !isSpeakerMode;
-  callAudioEngine.setVolume(isSpeakerMode ? 1.0 : 0.7);
+  const newVol = isSpeakerMode ? 1.0 : 0.6;
+  callAudioEngine.updateVolume(newVol);
+  if (callVolumeSlider) callVolumeSlider.value = Math.round(newVol * 100);
+  if (callVolumeVal) callVolumeVal.textContent = Math.round(newVol * 100) + '%';
   updateSpeakerButtonUI();
-  showToast(isSpeakerMode ? '🔊 Volume 100%' : '🔉 Volume 70%');
-  console.log('Volume toggled. High Volume mode:', isSpeakerMode);
+  showToast(isSpeakerMode ? '🔊 Volume 100% (Boost)' : '🔉 Volume 60% (Comfortable)');
+  console.log('Volume toggled. Current volume:', newVol);
 });
 
 // ============================================
